@@ -74,30 +74,36 @@ The backtest runs the strategy both ways and plots both, so you can see what the
 
 ### Results on real data
 
-Every run below is walk-forward, out-of-sample, with the equilibrium re-derived at each rebalance and views switched off (applying today's views to past trades would be look-ahead bias).
+**Headline: Global multi-asset ETFs, yearly, 2022-04 to 2026-08.** This is the run whose absolute numbers mean something — every one of the thirteen ETFs existed throughout the test window, so there is no survivorship bias and no selection bias. 100,000 USD becomes **150,198 USD** (9.63% a year) with a −13.8% worst drawdown, against **132,968** for an equal-weight basket of the same assets.
 
-**The model reproduces its prior, as the theory says it must.** With no views the posterior equals the prior, so the strategy cannot beat the market portfolio — any gap is the cost of the constraints:
+**The model reproduces its prior, exactly as the theory requires.** With no meaningful views the posterior equals the prior, so the unconstrained optimum *is* the market portfolio. On the ETF universe, where no constraint binds, this is directly visible in the holdings table:
+
+```
+        BL wt %   Market wt %
+SPY      53.80       53.80
+IWM       5.42        5.42
+GLD       8.82        8.82
+EEM       1.97        1.97
+```
+
+Identical to two decimals. And out of sample, across four different universes and horizons:
 
 | Run | BL (no overlay) vs its own prior |
 |---|---|
 | India Nifty, yearly | −0.23pp |
 | US S&P, yearly | −0.60pp |
 | US S&P, monthly | +0.05pp |
+| **Global multi-asset ETFs, yearly** | **−0.22pp** |
 
-Three markets, three horizons, δ from 2.04 to 4.69 — and the gap never exceeds two-thirds of a percentage point. That is the central validation of this implementation.
+Four markets, δ from 2.04 to 4.69 — and the gap never exceeds two-thirds of a percentage point. That is the central validation of this implementation.
 
-**The overlay is what adds risk-adjusted value.** US S&P 500, yearly, 2022-04 to 2026-08:
+**Views added nothing, and the app measured it rather than assuming it.** Momentum's realised hit rate was 51% over 74 checks on the ETF universe and 53% over 68 on Indian equities — barely distinguishable from chance — so the calibration assigned 2% and 4% confidence respectively, and the portfolio tilted 0.7% and 3.0% away from the market. That reproduces the null result found across three view engines and two universes in the underlying CQF study, and it is worth contrasting with what happens when confidence is *typed*: at a hand-picked 75%, the same portfolio tilted 37.4% — roughly nineteen times harder than the evidence supported.
 
-| | return/yr | vol | Sharpe | max DD |
-|---|---|---|---|---|
-| BL + overlay | 24.19% | 19.1% | **1.05** | −23.4% |
-| cap-weighted prior | 29.03% | 24.5% | 1.02 | −32.5% |
-| equal-weight | 22.43% | 20.8% | 0.88 | −27.8% |
-| S&P 500 | 12.47% | 16.4% | 0.51 | −21.2% |
+**What the optimiser is worth, in one column.** On the same thirteen assets, plain mean-variance puts **66.8% in GLD and 33.2% in SPY** and nothing anywhere else — the classic corner solution. Black-Litterman produces a graded thirteen-asset allocation from the identical covariance matrix and constraints.
 
-Best Sharpe of the four and a drawdown nine points shallower than the prior's — but note *where* that comes from. It is the risk overlay, not the views. Views added nothing in any run, which reproduces the null result found across three view engines and two universes in the underlying CQF study.
+**The volatility overlay buys drawdown, not return.** On the US stock universe it took Sharpe from 1.02 to 1.05 with a drawdown nine points shallower than the prior's; on the ETF universe it cut drawdown from −18.9% to −13.8% and cost 1.6pp of return. Reliable on risk, neutral-to-negative on Sharpe — which is what the simulations said to expect.
 
-**Absolute returns on the US runs are not meaningful.** The universe is the most liquid S&P 500 names *today*, which are disproportionately the ones that won 2022–2026; that universe beat the index by 16.6pp a year, and the app flags any gap above 8pp as look-ahead bias. Only the strategy-versus-its-own-prior comparison means anything.
+**A caveat on the stock universes.** Their absolute returns are not meaningful: the universe is the most liquid names in each index *today*, which are disproportionately the ones that won over the test period. The US stock universe beat the S&P 500 by 16.6pp a year on that basis alone, and the app flags any gap above 8pp as look-ahead bias. Only the strategy-versus-its-own-prior comparison survives there. The ETF universes exist precisely so there is a run without that problem.
 
 ### Honest diagnostics
 
@@ -114,6 +120,18 @@ The app is built to tell you when its own output is unreliable:
 ### Everything from the Markowitz app
 
 Nine markets (S&P 500, FTSE 350, HDAX, SBF 120, Nikkei 225, Nifty 500, S&P/TSX, ASX 200, Hang Seng), automatic liquidity screening, Simple and Advanced modes, an interactive Plotly efficient frontier with click-through allocations, a walk-forward out-of-sample backtest that re-derives the equilibrium at every rebalance, FX conversion, board-lot rounding, an executable trade list with CSV export, and run-to-run comparison.
+
+### History windows
+
+| Horizon | History | Frequency | Observations |
+|---|---|---|---|
+| Weekly — short-term | 5 years | daily | ~1,260 |
+| Monthly — medium-term | 8 years | daily | ~2,016 |
+| Yearly — long-term | 15 years | weekly | ~780 |
+
+Longer windows help the covariance matrix, whose estimation error falls roughly as 1/√T — and since π = δΣw, a better Σ means a better prior, not merely better risk numbers. They help far less with anything mean-like: a sample mean's standard error is driven by volatility rather than sample length, so decades are needed to pin one down, and reaching further back means averaging across regimes that no longer exist. These windows are the compromise.
+
+A single young ticker no longer truncates the universe. Any name covering less than 90% of the requested window is dropped and reported, rather than silently shortening every other asset's history to match it.
 
 ### Per-market recommended settings
 
