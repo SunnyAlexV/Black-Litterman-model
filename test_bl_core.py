@@ -765,6 +765,82 @@ check("shrinkage keeps a rank-deficient panel invertible (T < n)",
 
 # =========================================================
 print()
+print("--- buy-and-hold between rebalances ---")
+
+# The bug this guards against: `R @ w` applies a fixed weight vector to every
+# period, which silently rebalances the portfolio back to target every period.
+# A "yearly rebalanced" strategy computed that way is really a daily-rebalanced
+# one, and every rebalance frequency collapses to nearly the same answer.
+
+_w2 = np.array([0.5, 0.5])
+
+# One period: nothing has drifted yet, so both must agree exactly.
+_R1 = np.array([[0.02, -0.01]])
+_r1, _ = bl.buy_and_hold_returns(_R1, _w2)
+check("over a single period, buy-and-hold equals the fixed-weight formula",
+      abs(_r1[0] - float((_R1 @ _w2)[0])) < 1e-15)
+
+# A year of one asset compounding: the winner must grow as a share of the book.
+_Rg = np.zeros((252, 2)); _Rg[:, 0] = 0.001
+_rh, _wend = bl.buy_and_hold_returns(_Rg, _w2)
+check("holdings drift toward the winner", _wend[0] > 0.55, f"end weights {_wend.round(3)}")
+check("drifted weights still sum to 1", abs(_wend.sum() - 1.0) < 1e-12)
+check("buy-and-hold compounds more than silent rebalancing in a trend",
+      np.prod(1 + _rh) > np.prod(1 + (_Rg @ _w2)),
+      f"{np.prod(1+_rh):.5f} vs {np.prod(1+(_Rg @ _w2)):.5f}")
+
+# Flat market: no drift, so the two must coincide.
+_Rf = np.zeros((100, 2))
+_rf2, _wf = bl.buy_and_hold_returns(_Rf, _w2)
+check("a flat market produces no drift and no return",
+      np.allclose(_rf2, 0.0) and np.allclose(_wf, _w2))
+
+# Degenerate input must not raise.
+_re, _we = bl.buy_and_hold_returns(np.zeros((0, 2)), _w2)
+check("an empty segment returns empty without raising", len(_re) == 0)
+
+# End to end: with holdings drifting, rebalance frequency must actually MATTER.
+_rngb = np.random.default_rng(7)
+_nb, _Tb = 20, 3780
+_dr = _rngb.normal(0.00045, 0.00035, _nb)
+_Lb = np.tril(_rngb.normal(size=(_nb, _nb)) / np.sqrt(_nb)) + np.eye(_nb) * 0.6
+_Rb = np.array([_dr + (_Lb @ _rngb.normal(size=_nb)) * 0.011 for _ in range(_Tb)])
+_pxb = pd.DataFrame(100 * np.cumprod(1 + _Rb, axis=0),
+                    index=pd.bdate_range("2011-01-03", periods=_Tb),
+                    columns=[f"A{i}" for i in range(_nb)])
+_capsb = _rngb.random(_nb) ** 1.5
+_wmb = _capsb / _capsb.sum()
+
+
+def _builder_b(train_returns, cov_annual):
+    d, _ = bl.implied_risk_aversion(_wmb, cov_annual,
+                                    float(_wmb @ (train_returns.mean().values * 252)) - 0.06)
+    o = bl.black_litterman(cov_annual, _wmb, 0.06, 0.05, d,
+                           np.zeros((0, _nb)), np.zeros(0), np.zeros(0))
+    return o["mu_total"], o["Sigma_used"]
+
+
+_BASE = dict(freq="Daily", use_log=True, mu_builder=_builder_b,
+             cov_method="Ledoit-Wolf shrinkage", freq_per_year=252, rf=0.06,
+             stance="Long only", max_weight=0.12, gross_limit=None, objective="Max Sharpe",
+             alpha=0.95, tc_bps=25.0, borrow_bps=50.0, train_frac=0.45, resample_n=0,
+             caps_weights=_wmb, vol_target=None)
+_res = {}
+_turn = {}
+for _lbl, _reb in (("weekly", 5), ("yearly", 252)):
+    _bt = bl.run_backtest(_pxb, rebalance_periods=_reb, rebal_label=_lbl, **_BASE)
+    _res[_lbl] = _bt["strat"]["ann_ret"]
+    _turn[_lbl] = _bt["avg_turnover"]
+
+check("rebalance frequency changes the result once holdings drift",
+      abs(_res["weekly"] - _res["yearly"]) > 0.002,
+      f"weekly {_res['weekly']*100:.2f}%/yr vs yearly {_res['yearly']*100:.2f}%/yr")
+check("turnover per rebalance grows with the holding period",
+      _turn["yearly"] > _turn["weekly"] * 3,
+      f"weekly {_turn['weekly']*100:.1f}% vs yearly {_turn['yearly']*100:.1f}% per rebalance")
+
+# =========================================================
+print()
 if FAILURES:
     print(f"{len(FAILURES)} FAILED: " + ", ".join(FAILURES))
     sys.exit(1)
