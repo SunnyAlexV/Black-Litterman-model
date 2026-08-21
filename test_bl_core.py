@@ -628,6 +628,64 @@ check("hit rates stay in [0,1]", 0.0 <= hr_full <= 1.0 and 0.0 <= hr_part <= 1.0
 
 # =========================================================
 print()
+print("--- adaptive history window ---")
+
+_END = pd.Timestamp("2026-08-21")
+_IDX = pd.bdate_range(_END - pd.DateOffset(years=20), _END)
+_rng_h = np.random.default_rng(1)
+
+
+def _panel(n_old, n_young, young_frac=0.18):
+    """n_old assets with 20y history, n_young that listed recently."""
+    d = pd.DataFrame(index=_IDX)
+    for i in range(n_old + n_young):
+        s = pd.Series(100 * np.cumprod(1 + _rng_h.normal(0.0004, 0.012, len(_IDX))), index=_IDX)
+        if i >= n_old:
+            s.iloc[:-int(len(_IDX) * young_frac)] = np.nan
+        d[f"A{i}"] = s
+    return d
+
+
+HC = bl.HORIZON_CFG["Yearly — long-term"]
+panel = _panel(20, 10)
+start, keep, note = bl.choose_history_window(panel, list(panel.columns), 25, HC, 52)
+yrs = (_END - start).days / 365.25
+
+check("adaptive window takes the full length when enough assets support it",
+      yrs > 14, f"{yrs:.1f}y")
+check("young assets are excluded rather than truncating everyone",
+      len(keep) == 20 and all(int(t[1:]) < 20 for t in keep), f"kept {len(keep)}")
+check("the window note reports the length and the exclusions",
+      "15 years" in note and "too young" in note)
+
+# Every horizon should now estimate from the SAME long window — that is the
+# whole point of decoupling holding period from estimation length.
+lens = []
+for _k, _c in bl.HORIZON_CFG.items():
+    s_, k_, _n = bl.choose_history_window(panel, list(panel.columns), 25, _c,
+                                          bl.FREQ_PER_YEAR[_c["freq"]])
+    lens.append(round((_END - s_).days / 365.25))
+check("all three horizons estimate from the same history length", len(set(lens)) == 1, str(lens))
+
+# A universe where nothing is old must degrade gracefully, not collapse.
+young_only = _panel(0, 10)
+s2, k2, _n2 = bl.choose_history_window(young_only, list(young_only.columns), 10, HC, 52)
+check("an all-young universe shortens the window instead of failing",
+      len(k2) >= 3 and (_END - s2).days > 365, f"kept {len(k2)}, {(_END-s2).days/365.25:.1f}y")
+
+# Degenerate inputs must not raise.
+one = _panel(1, 0)
+s3, k3, _n3 = bl.choose_history_window(one, list(one.columns), 5, HC, 52)
+check("a single-asset panel does not raise", len(k3) >= 1)
+
+check("every horizon requests a long estimation window",
+      all(c["years"] >= 15 for c in bl.HORIZON_CFG.values()))
+check("horizons differ only in frequency and rebalance period",
+      {(c["freq"], c["rebal"]) for c in bl.HORIZON_CFG.values()}
+      == {("Daily", 5), ("Daily", 21), ("Weekly", 52)})
+
+# =========================================================
+print()
 if FAILURES:
     print(f"{len(FAILURES)} FAILED: " + ", ".join(FAILURES))
     sys.exit(1)
