@@ -72,6 +72,23 @@ The relative target is recomputed at each rebalance **from the training window o
 
 The backtest runs the strategy both ways and plots both, so you can see what the overlay cost or earned rather than taking it on faith.
 
+### Holdings drift between rebalances
+
+A subtle but consequential detail. The obvious way to compute a held portfolio's return is `R @ w` — apply the target weights to each period's returns. That is wrong for anything other than a continuously rebalanced book: it silently resets the portfolio to `w` every single period, so a "yearly rebalanced" strategy computed that way is really a daily-rebalanced one that happens to re-optimise annually.
+
+The symptom is unmistakable once you look for it: every rebalance frequency produces almost the same result. On real data, weekly (407 rebalances), monthly (97) and yearly (9) finished within **224 INR of each other on 100,000** — across a 45-fold range of trading frequency. That is not a finding about markets; it is a bug.
+
+Holdings now compound at their own returns between rebalances, and turnover is measured against the **drifted** weights rather than the previous targets. Frequency then matters, in the direction theory predicts — letting winners run beats resetting to target in a trending market:
+
+```
+horizon     rebals  turn/reb   ret/yr     final   maxDD
+weekly         416      2.0%   11.22%   240,472   -2.6%
+monthly         99      4.3%   11.20%   239,998   -2.6%
+yearly           9     23.8%   11.86%   252,139   -2.7%
+```
+
+The benchmark lines were fixed the same way: a cap-weighted market portfolio described as "buy & hold" now actually is one.
+
 ### Results on real data
 
 **Headline: Global multi-asset ETFs, yearly, 2022-04 to 2026-08.** This is the run whose absolute numbers mean something — every one of the thirteen ETFs existed throughout the test window, so there is no survivorship bias and no selection bias. 100,000 USD becomes **150,198 USD** (9.63% a year) with a −13.8% worst drawdown, against **132,968** for an equal-weight basket of the same assets.
@@ -168,7 +185,7 @@ On Windows, if `streamlit` isn't on your PATH, use `python -m streamlit run blac
 python test_bl_core.py
 ```
 
-105 headless checks covering the numeric core, with Streamlit and yfinance stubbed so nothing needs a server or a network connection. They check reverse optimisation round-trips, that the two posterior formulas agree, Ω construction under both methods, view parsing and excess-return conversion, τ invariance, confidence linearity, the volatility overlay's no-look-ahead property, the negative-Sharpe artifact, the share allocator (never overspends, respects board lots, strands less than one lot), the relative volatility target, the systematic view engines — both proven free of look-ahead by divergent-futures tests — the adaptive history window, and that the vectorised Ledoit-Wolf estimator matches the textbook loop to machine precision.
+113 headless checks covering the numeric core, with Streamlit and yfinance stubbed so nothing needs a server or a network connection. They check reverse optimisation round-trips, that the two posterior formulas agree, Ω construction under both methods, view parsing and excess-return conversion, τ invariance, confidence linearity, the volatility overlay's no-look-ahead property, the negative-Sharpe artifact, the share allocator (never overspends, respects board lots, strands less than one lot), the relative volatility target, the systematic view engines — both proven free of look-ahead by divergent-futures tests — the adaptive history window, and that the vectorised Ledoit-Wolf estimator matches the textbook loop to machine precision.
 
 Two properties worth knowing about, both locked down by tests:
 
