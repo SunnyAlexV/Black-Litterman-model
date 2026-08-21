@@ -45,15 +45,91 @@ FREQ_RULE = {"Daily": None, "Weekly": "W-FRI", "Monthly": "ME"}
 # back you reach, the more you are averaging across regimes that no longer
 # exist. These windows are a compromise: long enough that Sigma is well
 # estimated, short enough that the data still describes the current world.
+# How long you intend to HOLD and how much history you should ESTIMATE FROM are
+# two different questions, and tying them together was the flaw in the earlier
+# design: choosing "weekly" quietly cut the estimation window to two years and
+# left the covariance matrix — and therefore pi = delta*Sigma*w — running on
+# fumes. Wanting to trade weekly is a preference; how much data Sigma needs is
+# a statistical fact, and the answer to the second is always "as much as is
+# reliably available".
+#
+# So every horizon now estimates from the same long window. The horizon sets
+# only the return frequency and how often the portfolio is rebalanced.
 HORIZON_CFG = {
-    "Weekly — short-term": {"years": 5, "freq": "Daily", "rebal": 5, "rebal_label": "weekly"},
-    "Monthly — medium-term": {"years": 8, "freq": "Daily", "rebal": 21, "rebal_label": "monthly"},
-    "Yearly — long-term": {"years": 15, "freq": "Weekly", "rebal": 52, "rebal_label": "yearly"},
+    "Weekly — short-term": {"years": 15, "min_years": 5, "freq": "Daily",
+                            "rebal": 5, "rebal_label": "weekly"},
+    "Monthly — medium-term": {"years": 15, "min_years": 5, "freq": "Daily",
+                              "rebal": 21, "rebal_label": "monthly"},
+    "Yearly — long-term": {"years": 15, "min_years": 5, "freq": "Weekly",
+                           "rebal": 52, "rebal_label": "yearly"},
 }
 
 # A single young ticker must not truncate everyone else. Keep a name only if it
-# covers at least this share of the requested window; drop it otherwise.
-MIN_HISTORY_COVERAGE = 0.90
+# covers at least this share of the chosen window.
+MIN_HISTORY_COVERAGE = 0.95
+# Sigma has n(n+1)/2 free parameters; this is the observations-per-asset bar the
+# adaptive window aims to clear before it stops lengthening.
+TARGET_OBS_PER_ASSET = 25
+
+
+def choose_history_window(close, candidates, want_n, hcfg, freq_per_year):
+    """Pick the longest history window that keeps a full-sized universe.
+
+    Forcing a fixed 15 years would silently discard every asset younger than
+    that — half a Nifty universe, in practice. Forcing a short window would
+    leave Sigma undernourished. So walk the window down from the maximum and
+    stop at the first length that still supports a proper universe and clears
+    the observations-per-asset bar.
+
+    Returns (start_timestamp, kept_tickers, note).
+    """
+    end = close.index.max()
+    max_y, min_y = float(hcfg["years"]), float(hcfg["min_years"])
+    per_year = freq_per_year
+    first_valid = {}
+    for t in candidates:
+        s = close[t].dropna()
+        if not s.empty:
+            first_valid[t] = s.index.min()
+    if not first_valid:
+        return close.index.min(), list(candidates), "no usable history"
+
+    need_n = max(5, int(math.ceil(0.8 * want_n)))
+    best = None
+    years = max_y
+    while years >= min_y - 1e-9:
+        start = end - pd.DateOffset(years=years)
+        cutoff = start + pd.Timedelta(days=int(365.25 * years * (1 - MIN_HISTORY_COVERAGE)))
+        keep = [t for t, d in first_valid.items() if d <= cutoff]
+        obs = years * per_year
+        if len(keep) >= need_n and (len(keep) == 0 or obs / max(len(keep), 1) >= TARGET_OBS_PER_ASSET):
+            best = (start, keep, years)
+            break
+        if best is None and len(keep) >= need_n:
+            best = (start, keep, years)
+        years -= 1.0
+
+    if best is None:
+        # Nothing clears the bar — take the longest window that keeps the most
+        # names, which is what the user would do by hand anyway.
+        start = end - pd.DateOffset(years=min_y)
+        keep = [t for t, d in first_valid.items() if d <= start + pd.Timedelta(days=180)]
+        if len(keep) < 3:
+            keep = sorted(first_valid, key=lambda t: first_valid[t])[:max(3, want_n)]
+            start = max(first_valid[t] for t in keep)
+        best = (start, keep, min_y)
+
+    start, keep, years = best
+    keep = [t for t in candidates if t in keep]          # preserve liquidity order
+    dropped = [t for t in candidates if t not in keep]
+    note = (f"Estimating from **{years:,.0f} years** of history "
+            f"({int(years * per_year):,} {hcfg['freq'].lower()} observations, "
+            f"~{int(years * per_year / max(len(keep), 1)):,} per asset). ")
+    if dropped:
+        note += (f"{len(dropped)} name(s) too young for that window were replaced by "
+                 f"longer-lived ones: {', '.join(dropped[:6])}"
+                 f"{'…' if len(dropped) > 6 else ''}. ")
+    return start, keep, note
 AUTO_HOLDINGS = 25  # stocks auto-selected in Simple mode
 
 # Market -> (broad index ticker, label) for the "beat the market" benchmark.
@@ -2560,7 +2636,7 @@ def main():
 
     hcfg = HORIZON_CFG[horizon]
     today = pd.Timestamp.today().normalize()
-    auto_start = today - pd.DateOffset(years=hcfg["years"])
+    auto_start = today - pd.DateOffset(years=hcfg["years"] + 1)
     auto_end = today
 
     _rf_default = market_default(market_name, "rf")
@@ -2846,35 +2922,18 @@ def main():
                     f"sits in cash. Lower *Number of stocks to hold*, or accept the "
                     f"rounding — the 'What to buy' tab reports exactly how much stays idle.")
 
-        # Asking for 15 years and holding one ticker that listed 3 years ago
-        # would, with a naive dropna(), silently truncate EVERY asset to 3
-        # years — the opposite of what the user asked for, and invisible. Drop
-        # the short-history names instead and say which.
-        _cand = [t for t in top_tickers if t in close.columns]
-        _span = close.index.max() - close.index.min()
-        _short = []
-        if len(_cand) > 2 and _span.days > 0:
-            keep = []
-            for t in _cand:
-                s = close[t].dropna()
-                if s.empty:
-                    _short.append((t, 0.0)); continue
-                cov = (close.index.max() - s.index.min()).days / _span.days
-                (keep if cov >= MIN_HISTORY_COVERAGE else _short).append(
-                    t if cov >= MIN_HISTORY_COVERAGE else (t, cov))
-            if len(keep) >= max(3, int(0.5 * len(_cand))):
-                _cand = keep
-            else:
-                _short = []          # too many would go: keep everything, truncate
-        if _short:
-            st.warning(
-                "**Dropped for short history:** "
-                + ", ".join(f"{t} ({c*100:,.0f}% of the window)" for t, c in _short)
-                + f". Each covers less than {MIN_HISTORY_COVERAGE*100:,.0f}% of the "
-                  f"{hcfg['years']}-year window you asked for. Keeping them would have "
-                  f"truncated *every* asset to the shortest one's history.")
-
-        prices = close[_cand].dropna()
+        # Choose the estimation window from the data rather than imposing one.
+        # A naive dropna() over a fixed 15-year request would silently truncate
+        # EVERY asset to the youngest one's history; a fixed short window would
+        # starve Sigma. This picks the longest window that still supports a
+        # full-sized universe, and backfills the dropped names from the next
+        # most liquid long-lived candidates.
+        _all_ranked = rank_by_liquidity(close, volume, min(len(close.columns), 4 * top_n))
+        _win_start, _keep, _win_note = choose_history_window(
+            close, _all_ranked, top_n, hcfg, FREQ_PER_YEAR[ret_freq])
+        _cand = _keep[:top_n] if len(_keep) >= top_n else _keep
+        prices = close.loc[close.index >= _win_start, _cand].dropna()
+        history_note = _win_note
         if prices.shape[1] < 2 or prices.empty:
             st.error("Could not assemble at least 2 liquid tickers with overlapping history. "
                      "Widen the date range or increase the number of stocks.")
@@ -2924,6 +2983,7 @@ def main():
             "native_ccy": native_ccy,
             "start_str": start_date.strftime("%Y-%m-%d"), "end_str": end_date.strftime("%Y-%m-%d"),
             "universe_note": (
+                history_note +
                 (f"**Trimmed from {auto_trimmed[0]} to {auto_trimmed[1]} names to fit "
                  f"{total_capital:,.0f} {base_currency}.** At these share prices, "
                  f"{auto_trimmed[0]} positions would round down hard and leave a large "
@@ -3275,6 +3335,20 @@ def main():
                                           uni["start_str"], uni["end_str"])
                 caps_map = uni["caps"]; liq_fallback = None
 
+                # Re-walking the entire history to re-measure a hit rate at every
+                # single rebalance costs ~90ms a time — 40 seconds across a
+                # weekly backtest, for a number that barely moves between
+                # adjacent weeks. Recompute it only when the training window has
+                # grown by 5% or more; that is still strictly backward-looking.
+                _hr_cache = {}
+
+                def _cached_hit_rate(px_now, engine, fpy, hp):
+                    bucket = int(math.log(max(len(px_now), 2)) / math.log(1.05))
+                    key = (engine, hp, bucket)
+                    if key not in _hr_cache:
+                        _hr_cache[key] = engine_hit_rate(px_now, engine, fpy, holding_periods=hp)
+                    return _hr_cache[key]
+
                 def _make_builder(with_views, engine=None):
                     def _builder(train_returns, cov_annual):
                         # re-derive the prior from data available at this point only
@@ -3292,8 +3366,8 @@ def main():
                             # window. Nothing from the future enters, so unlike typed
                             # views this genuinely tests whether views add value.
                             px_now = prices.loc[:train_returns.index[-1]]
-                            hr_t, nc_t = engine_hit_rate(px_now, engine, freq_per_year,
-                                                         holding_periods=hcfg["rebal"])
+                            hr_t, nc_t = _cached_hit_rate(px_now, engine, freq_per_year,
+                                                          hcfg["rebal"])
                             c_t, _ = confidence_from_hit_rate(hr_t, nc_t)
                             Pe, Qe, ce, _lab = systematic_views(
                                 px_now, usable, engine, freq_per_year,
