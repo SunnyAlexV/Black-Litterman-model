@@ -37,11 +37,23 @@ FREQ_RULE = {"Daily": None, "Weekly": "W-FRI", "Monthly": "ME"}
 
 # Investment horizon -> years of history, return frequency, and how often the
 # walk-forward backtest rebalances (in return-periods) + a human label.
+# History windows. Longer is better for the COVARIANCE matrix, which is what
+# Black-Litterman actually leans on (pi = delta*Sigma*w), and the estimation
+# error there falls roughly as 1/sqrt(T). It is much less obviously better for
+# anything mean-like: a sample mean's standard error is driven by volatility,
+# not sample length, so decades are needed to pin one down — and the further
+# back you reach, the more you are averaging across regimes that no longer
+# exist. These windows are a compromise: long enough that Sigma is well
+# estimated, short enough that the data still describes the current world.
 HORIZON_CFG = {
-    "Weekly — short-term": {"years": 2, "freq": "Daily", "rebal": 5, "rebal_label": "weekly"},
-    "Monthly — medium-term": {"years": 4, "freq": "Daily", "rebal": 21, "rebal_label": "monthly"},
-    "Yearly — long-term": {"years": 8, "freq": "Weekly", "rebal": 52, "rebal_label": "yearly"},
+    "Weekly — short-term": {"years": 5, "freq": "Daily", "rebal": 5, "rebal_label": "weekly"},
+    "Monthly — medium-term": {"years": 8, "freq": "Daily", "rebal": 21, "rebal_label": "monthly"},
+    "Yearly — long-term": {"years": 15, "freq": "Weekly", "rebal": 52, "rebal_label": "yearly"},
 }
+
+# A single young ticker must not truncate everyone else. Keep a name only if it
+# covers at least this share of the requested window; drop it otherwise.
+MIN_HISTORY_COVERAGE = 0.90
 AUTO_HOLDINGS = 25  # stocks auto-selected in Simple mode
 
 # Market -> (broad index ticker, label) for the "beat the market" benchmark.
@@ -2834,7 +2846,35 @@ def main():
                     f"sits in cash. Lower *Number of stocks to hold*, or accept the "
                     f"rounding — the 'What to buy' tab reports exactly how much stays idle.")
 
-        prices = close[[t for t in top_tickers if t in close.columns]].dropna()
+        # Asking for 15 years and holding one ticker that listed 3 years ago
+        # would, with a naive dropna(), silently truncate EVERY asset to 3
+        # years — the opposite of what the user asked for, and invisible. Drop
+        # the short-history names instead and say which.
+        _cand = [t for t in top_tickers if t in close.columns]
+        _span = close.index.max() - close.index.min()
+        _short = []
+        if len(_cand) > 2 and _span.days > 0:
+            keep = []
+            for t in _cand:
+                s = close[t].dropna()
+                if s.empty:
+                    _short.append((t, 0.0)); continue
+                cov = (close.index.max() - s.index.min()).days / _span.days
+                (keep if cov >= MIN_HISTORY_COVERAGE else _short).append(
+                    t if cov >= MIN_HISTORY_COVERAGE else (t, cov))
+            if len(keep) >= max(3, int(0.5 * len(_cand))):
+                _cand = keep
+            else:
+                _short = []          # too many would go: keep everything, truncate
+        if _short:
+            st.warning(
+                "**Dropped for short history:** "
+                + ", ".join(f"{t} ({c*100:,.0f}% of the window)" for t, c in _short)
+                + f". Each covers less than {MIN_HISTORY_COVERAGE*100:,.0f}% of the "
+                  f"{hcfg['years']}-year window you asked for. Keeping them would have "
+                  f"truncated *every* asset to the shortest one's history.")
+
+        prices = close[_cand].dropna()
         if prices.shape[1] < 2 or prices.empty:
             st.error("Could not assemble at least 2 liquid tickers with overlapping history. "
                      "Widen the date range or increase the number of stocks.")
