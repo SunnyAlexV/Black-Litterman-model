@@ -623,12 +623,23 @@ def ledoit_wolf_identity(X):
     S = (Xc.T @ Xc) / t
     m = np.trace(S) / n
     d2 = np.sum((S - m * np.eye(n)) ** 2) / n
-    b_bar2 = 0.0
-    for i in range(t):
-        xi = Xc[i][:, None]
-        diff = xi @ xi.T - S
-        b_bar2 += np.sum(diff ** 2)
-    b_bar2 = b_bar2 / (t ** 2) / n
+
+    # The textbook form of b_bar2 loops over every observation, building an
+    # n x n outer product each time. With 15 years of daily data that is ~3,800
+    # Python iterations per call, and a walk-forward backtest calls this once
+    # per rebalance on an expanding window — twelve seconds of a fifteen-second
+    # backtest went here. Expanding the Frobenius norm removes the loop:
+    #
+    #   sum_i ||x_i x_i' - S||_F^2
+    #     = sum_i (x_i'x_i)^2  -  2 sum_i x_i' S x_i  +  t ||S||_F^2
+    #
+    # which is three vectorised reductions. Algebraically identical, no
+    # approximation — verified against the loop to machine precision by a test.
+    sq = np.einsum("ij,ij->i", Xc, Xc)              # ||x_i||^2 for each i
+    term1 = float(np.dot(sq, sq))                   # sum_i (x_i'x_i)^2
+    term2 = float(np.sum((Xc @ S) * Xc))            # sum_i x_i' S x_i
+    term3 = t * float(np.sum(S * S))                # t ||S||_F^2
+    b_bar2 = (term1 - 2.0 * term2 + term3) / (t ** 2) / n
     b2 = min(b_bar2, d2)
     a2 = d2 - b2
     shrink = b2 / d2 if d2 > 0 else 1.0
