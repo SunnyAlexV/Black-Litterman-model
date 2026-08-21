@@ -680,9 +680,21 @@ check("a single-asset panel does not raise", len(k3) >= 1)
 
 check("every horizon requests a long estimation window",
       all(c["years"] >= 15 for c in bl.HORIZON_CFG.values()))
-check("horizons differ only in frequency and rebalance period",
-      {(c["freq"], c["rebal"]) for c in bl.HORIZON_CFG.values()}
-      == {("Daily", 5), ("Daily", 21), ("Weekly", 52)})
+check("every horizon estimates from the same return frequency",
+      len({c["freq"] for c in bl.HORIZON_CFG.values()}) == 1,
+      str({c["freq"] for c in bl.HORIZON_CFG.values()}))
+check("horizons differ ONLY in how often they rebalance",
+      {c["rebal"] for c in bl.HORIZON_CFG.values()} == {5, 21, 252}
+      and len({(c["years"], c["min_years"], c["freq"]) for c in bl.HORIZON_CFG.values()}) == 1)
+
+# Equal information means equal observations: no horizon may see less data than
+# another. This is the property that stops "yearly" being quietly worse.
+_obs = {k: c["years"] * bl.FREQ_PER_YEAR[c["freq"]] for k, c in bl.HORIZON_CFG.items()}
+check("all horizons get an identical observation count", len(set(_obs.values())) == 1,
+      str(_obs))
+check("that count clears the observations-per-asset bar for a 25-asset universe",
+      min(_obs.values()) / 25 >= bl.TARGET_OBS_PER_ASSET,
+      f"{min(_obs.values())/25:.0f} per asset")
 
 # =========================================================
 print()
