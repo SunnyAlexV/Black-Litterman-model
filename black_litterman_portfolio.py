@@ -8,6 +8,7 @@ import streamlit as st
 import yfinance as yf
 import matplotlib.pyplot as plt
 from scipy.optimize import minimize, minimize_scalar
+from concurrent.futures import ThreadPoolExecutor
 
 try:
     import plotly.graph_objects as go
@@ -60,8 +61,13 @@ HORIZON_CFG = {
                             "rebal": 5, "rebal_label": "weekly"},
     "Monthly — medium-term": {"years": 15, "min_years": 5, "freq": "Daily",
                               "rebal": 21, "rebal_label": "monthly"},
-    "Yearly — long-term": {"years": 15, "min_years": 5, "freq": "Weekly",
-                           "rebal": 52, "rebal_label": "yearly"},
+    # Yearly estimates from DAILY returns too. Tying the return frequency to the
+    # holding period was the same mistake as tying the window length to it: a
+    # yearly rebalancer gained nothing from throwing away four fifths of its
+    # observations (780 weekly instead of 3,780 daily). All three horizons now
+    # see identical data and differ only in how often they trade.
+    "Yearly — long-term": {"years": 15, "min_years": 5, "freq": "Daily",
+                           "rebal": 252, "rebal_label": "yearly"},
 }
 
 # A single young ticker must not truncate everyone else. Keep a name only if it
@@ -397,8 +403,8 @@ MARKETS = {
 # =========================================================
 # DATA DOWNLOAD
 # =========================================================
-def _download_batch(tickers, start, end):
-    raw = yf.download(tickers=list(tickers), start=start, end=end,
+def _download_batch(tickers, start, end, interval="1d"):
+    raw = yf.download(tickers=list(tickers), start=start, end=end, interval=interval,
                       auto_adjust=True, progress=False, group_by="column")
     if raw is None or raw.empty:
         return pd.DataFrame(), pd.DataFrame()
@@ -426,11 +432,15 @@ def _download_batch(tickers, start, end):
 
 
 @st.cache_data(show_spinner=False)
-def download_prices_volume(tickers, start, end, retries=2):
+def download_prices_volume(tickers, start, end, retries=2, interval="1d"):
     """Download close+volume, retrying tickers that come back empty (recovers
     transient Yahoo rate-limit / hiccup failures rather than treating them as
-    delisted). Genuinely unavailable symbols are simply left out."""
-    close, volume = _download_batch(tickers, start, end)
+    delisted). Genuinely unavailable symbols are simply left out.
+
+    `interval` matters for speed: the yearly horizon works in weekly returns, so
+    pulling 15 years of DAILY bars for ~100 symbols downloads and parses five
+    times more data than it can ever use."""
+    close, volume = _download_batch(tickers, start, end, interval)
 
     def _missing(cl):
         done = set(cl.columns) if not cl.empty else set()
@@ -441,7 +451,7 @@ def download_prices_volume(tickers, start, end, retries=2):
     for _ in range(retries):
         if not missing:
             break
-        c2, v2 = _download_batch(missing, start, end)
+        c2, v2 = _download_batch(missing, start, end, interval)
         if not c2.empty:
             for col in c2.columns:
                 close[col] = c2[col]
@@ -517,8 +527,7 @@ def get_market_caps(tickers):
     asset-class prior by volume produces a "market portfolio" that is 64% SPY
     and 15% bonds, which is not the market by any definition.
     """
-    caps = {}
-    for t in tickers:
+    def _one(t):
         mc = None
         try:
             fi = yf.Ticker(t).fast_info
@@ -527,8 +536,9 @@ def get_market_caps(tickers):
         except Exception:
             mc = None
         if not mc:
-            # Funds: net assets / AUM. Slower (hits .info) but only needed for
-            # the handful of symbols where fast_info has no market cap.
+            # Funds have no market cap, so fall back to net assets. This hits
+            # .info, which is an order of magnitude slower than fast_info — for
+            # an ETF universe that is EVERY symbol, so it must not run serially.
             try:
                 info = yf.Ticker(t).info or {}
                 mc = (info.get("totalAssets") or info.get("netAssets")
@@ -536,9 +546,22 @@ def get_market_caps(tickers):
             except Exception:
                 mc = None
         try:
-            caps[t] = float(mc) if mc else np.nan
+            return t, (float(mc) if mc else np.nan)
         except (TypeError, ValueError):
-            caps[t] = np.nan
+            return t, np.nan
+
+    tickers = list(tickers)
+    caps = {}
+    # These are network-bound, so threads help enormously and cost nothing.
+    # Serial, an ETF universe took the better part of a minute here.
+    try:
+        with ThreadPoolExecutor(max_workers=min(12, max(1, len(tickers)))) as ex:
+            for t, v in ex.map(_one, tickers):
+                caps[t] = v
+    except Exception:
+        for t in tickers:
+            k, v = _one(t)
+            caps[k] = v
     return caps
 
 
@@ -2189,16 +2212,23 @@ def _render_backtest(res, bt, bt_eq=None):
                 f"there was nothing for it to cut. Lower the target below "
                 f"{u['ann_vol']*100:,.0f}% to make it bite.")
         elif d_dd > 0.005:
-            st.success(
-                f"**The overlay cut the worst drawdown by {d_dd*100:,.1f} points** "
-                f"({u['max_dd']*100:,.1f}% → {s['max_dd']*100:,.1f}%) and held volatility at "
-                f"{s['ann_vol']*100:,.1f}% instead of {u['ann_vol']*100:,.1f}%. "
-                + ((f"Sharpe also improved, {u['sharpe']:,.2f} → {s['sharpe']:,.2f}."
-                    if d_sharpe > 0.02 else
-                    f"Sharpe was {u['sharpe']:,.2f} → {s['sharpe']:,.2f} — roughly unchanged or "
-                    f"slightly worse, which is the common case. Drawdown reduction is the "
-                    f"reliable benefit here, not a higher Sharpe.") if sharpe_meaningful else
-                   "That is the benefit the overlay reliably delivers."))
+            # State the trade, both sides, and leave the judgement to the reader.
+            # The overlay bought lower risk with lower return; whether that was
+            # worth it is not something a backtest can settle.
+            st.info(
+                f"**The overlay traded return for risk on this run.** Drawdown "
+                f"{u['max_dd']*100:,.1f}% → {s['max_dd']*100:,.1f}% "
+                f"({d_dd*100:+,.1f}pp) and volatility {u['ann_vol']*100:,.1f}% → "
+                f"{s['ann_vol']*100:,.1f}%, at a cost of "
+                f"{(u['ann_ret']-s['ann_ret'])*100:,.2f}pp of return a year "
+                f"({u['ann_ret']*100:,.2f}% → {s['ann_ret']*100:,.2f}%). "
+                + ((f"Sharpe {u['sharpe']:,.2f} → {s['sharpe']:,.2f}."
+                    if sharpe_meaningful else "")
+                   ) +
+                " Across simulated markets this overlay reduced drawdown in most runs and moved "
+                "Sharpe in either direction about equally often, so treat the risk reduction as "
+                "the expected effect and any Sharpe gain as this window's luck. One historical "
+                "path either way.")
         else:
             st.info(
                 f"**Little effect over this window** — drawdown {u['max_dd']*100:,.1f}% → "
@@ -2226,6 +2256,11 @@ def _render_backtest(res, bt, bt_eq=None):
         f"**In plain terms:** running this {reb}-rebalanced strategy, your {total_capital:,.0f} {bc} "
         f"would have become **{strat_final:,.0f} {bc}** — a {'profit' if strat_pnl >= 0 else 'loss'} of "
         f"**{strat_pnl:+,.0f} {bc} ({strat_ret_tot*100:+,.1f}%)** over ~{yrs:.1f} years.{beat_market}")
+    st.caption(
+        f"That is one historical path through one market, with {bt.get('n_rebalances', 0)} "
+        f"rebalances. It is a description of what these rules would have done, not an estimate of "
+        f"what they will do. The strategy-versus-its-own-prior line below is the more informative "
+        f"comparison, because it isolates the model from whatever the market happened to deliver.")
 
     bcols = st.columns(4)
     bcols[0].metric(f"Test P&L ({bc})", f"{strat_pnl:+,.0f}", delta=f"{strat_ret_tot*100:+,.1f}% total")
@@ -2317,12 +2352,16 @@ def _render_backtest(res, bt, bt_eq=None):
                         f"moved off the prior — which is the model correctly declining to act on "
                         f"a weak signal.")
                 elif d_r > 0:
-                    st.success(
-                        f"**The rule added {d_r*100:,.2f}pp a year over pure equilibrium.** This is "
-                        f"a real out-of-sample result: the views were rebuilt from scratch at every "
-                        f"rebalance using only data available then, and the confidence was "
-                        f"recalibrated from the rule's hit rate at that point. No look-ahead. "
-                        f"One historical path, though — not proof the edge persists.")
+                    st.info(
+                        f"**The rule was ahead of pure equilibrium by {d_r*100:,.2f}pp a year on "
+                        f"this path.** The construction is sound — views rebuilt from scratch at "
+                        f"every rebalance from data available then, confidence recalibrated from "
+                        f"the hit rate at that point, no look-ahead — but that establishes the "
+                        f"test was fair, not that the edge is real. A single historical path "
+                        f"cannot distinguish a {d_r*100:,.2f}pp edge from noise, and the confidence "
+                        f"the rule earned ({res.get('sys_conf', 0)*100:,.0f}%) is itself a measure "
+                        f"of how weak the signal was. Treat it as a hypothesis worth re-testing on "
+                        f"another market, not as a result.")
                 else:
                     st.warning(
                         f"**The rule cost {abs(d_r)*100:,.2f}pp a year versus doing nothing.** That "
@@ -2407,7 +2446,7 @@ def render_results(res):
     top_ix = np.argsort(-np.abs(weights))[:3]
     top_txt = ", ".join(f"**{res['usable'][i]}** {weights[i]*100:,.1f}%" for i in top_ix)
     st.markdown(
-        f"**{n_held} positions**, largest: {top_txt}. Expected **{res['port_ret']*100:,.1f}%** a year "
+        f"**{n_held} positions**, largest: {top_txt}. Model-implied **{res['port_ret']*100:,.1f}%** a year "
         f"with **{res['port_vol']*100:,.1f}%** volatility (Sharpe **{res['port_sharpe']:,.2f}**), "
         f"sitting **{tilt*100:,.1f}%** away from just holding the market."
         + ("  \n⚠️ Expected return is *below* your risk-free rate of "
@@ -2453,7 +2492,12 @@ def _render_holdings(res, bc, weights):
         st.caption(res["universe_note"])
     st.caption(res["settings_caption"])
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Expected annual return", f"{res['port_ret']*100:,.2f}%",
+    m1.metric("Model-implied annual return", f"{res['port_ret']*100:,.2f}%",
+              help="NOT a forecast. This is what the posterior expected returns imply for this "
+                   "weighting — and the posterior is built from today's market weights and a "
+                   "historical covariance matrix, neither of which predicts anything. Treat it as "
+                   "a description of the inputs, not of the future. The out-of-sample backtest is "
+                   "the only number here with any predictive claim attached, and it is one path.",
               delta=f"{-res['borrow_cost_annual']*100:,.2f}% borrow" if res["short_gross"] > 0 else None)
     m2.metric("Annual volatility", f"{res['port_vol']*100:,.2f}%")
     m3.metric("Sharpe ratio", f"{res['port_sharpe']:,.2f}")
@@ -2857,14 +2901,16 @@ def main():
         f"disagree, and it moves only as far as your confidence warrants. "
         f"Built from ~{hcfg['years']} years of {ret_freq.lower()} history, priced in {base_currency}.")
 
-    if horizon.startswith("Weekly"):
-        st.warning(
-            "**Weekly is the weakest setting for this model.** Black-Litterman is a *strategic* "
-            "allocation model: its prior is market capitalisation, which barely moves week to "
-            "week. Re-optimising weekly mostly harvests estimation noise and pays real trading "
-            "costs for it, and the 2-year window it uses leaves too little data to estimate risk "
-            "for 25 assets. **Yearly — long-term** is the setting this model was designed for. "
-            "Use Weekly to see the machinery react, not to decide an allocation.")
+    # All three horizons now see identical data, so none is "the good one".
+    # State the actual trade-off neutrally instead of steering.
+    _reb_per_year = FREQ_PER_YEAR[hcfg["freq"]] / hcfg["rebal"]
+    st.caption(
+        f"**All three horizons estimate from the same {hcfg['years']}-year daily history.** They "
+        f"differ only in how often you trade: this one rebalances about "
+        f"**{_reb_per_year:,.0f} times a year**. More rebalances means more decisions to judge the "
+        f"strategy on, and more trading costs; fewer means a cleaner read on the long-run "
+        f"allocation, from a smaller sample of decisions. Neither is more correct."
+    )
 
     if mode != "Advanced":
         st.caption(
@@ -2884,8 +2930,9 @@ def main():
 
         seed_tickers = MARKETS[market_name]["tickers"]
         with st.spinner("Downloading market data..."):
-            close, volume = download_prices_volume(seed_tickers, start_date.strftime("%Y-%m-%d"),
-                                                   end_date.strftime("%Y-%m-%d"))
+            close, volume = download_prices_volume(
+                seed_tickers, start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d"),
+                interval=("1wk" if ret_freq == "Weekly" else "1d"))
         if close.empty:
             st.error(
                 "No price data returned. Common causes:\n\n"
