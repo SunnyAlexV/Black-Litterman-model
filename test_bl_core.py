@@ -541,6 +541,93 @@ check("relative targeting lands near the requested fraction",
 
 # =========================================================
 print()
+print("--- systematic view engines ---")
+
+rng_e = np.random.default_rng(2)
+n_e, T_e = 8, 1500
+drift_e = np.linspace(0.0010, -0.0002, n_e)          # A0 best, A7 worst, by construction
+R_e = rng_e.normal(drift_e, 0.011, size=(T_e, n_e))
+idx_e = pd.bdate_range("2019-01-01", periods=T_e)
+cols_e = [f"A{i}" for i in range(n_e)]
+px_e = pd.DataFrame(100 * np.cumprod(1 + R_e, axis=0), index=idx_e, columns=cols_e)
+
+for eng in ("momentum", "reversal", "trend", "lowvol"):
+    P_s, Q_s, c_s, lab_s = bl.systematic_views(px_e, cols_e, eng, 252, n_pairs=2)
+    check(f"{eng}: produces well-formed views",
+          P_s.shape[0] == len(Q_s) == len(lab_s) and P_s.shape[1] == n_e and P_s.shape[0] > 0)
+    if eng != "trend":
+        check(f"{eng}: relative rows are +1/-1 and sum to zero",
+              all(abs(P_s[r].sum()) < 1e-12 for r in range(P_s.shape[0])))
+
+# Momentum on a series with a built-in winner must actually find it.
+P_m, Q_m, _c, lab_m = bl.systematic_views(px_e, cols_e, "momentum", 252, n_pairs=1)
+check("momentum picks the genuinely strongest asset as the long leg",
+      P_m[0, 0] == 1.0, lab_m[0] if lab_m else "no view")
+
+# THE property that makes rule-driven backtests honest: an engine is a pure
+# function of the prices handed to it. Same history + different future must
+# give bit-identical views.
+fut_a = px_e.copy()
+fut_b = px_e.copy()
+fut_b.iloc[900:] = fut_b.iloc[900:] * 3.0
+same_views = True
+for eng in ("momentum", "reversal", "trend", "lowvol"):
+    va = bl.systematic_views(fut_a.iloc[:900], cols_e, eng, 252)
+    vb = bl.systematic_views(fut_b.iloc[:900], cols_e, eng, 252)
+    if not (np.allclose(va[1], vb[1]) and va[3] == vb[3] and np.allclose(va[0], vb[0])):
+        same_views = False
+check("engines read no future data (identical views when only the future differs)", same_views)
+
+# Q must stay bounded however violent the history is.
+wild = px_e.copy()
+wild.iloc[:, 0] = wild.iloc[:, 0] * np.linspace(1, 50, T_e)
+_Pw, Qw, _cw, _lw = bl.systematic_views(wild, cols_e, "momentum", 252, max_spread=0.20)
+check("view size is capped no matter how extreme the signal",
+      np.all(np.abs(Qw) <= 0.20 + 1e-12), f"max |Q| = {np.abs(Qw).max():.4f}")
+
+# Too little history must yield no views rather than nonsense.
+check("insufficient history produces no views",
+      bl.systematic_views(px_e.iloc[:5], cols_e, "momentum", 252)[0].shape[0] == 0)
+
+print()
+print("--- confidence from hit rate ---")
+
+check("a coin-flip hit rate earns zero confidence",
+      bl.confidence_from_hit_rate(0.50, 200)[0] == 0.0)
+check("a below-chance hit rate earns zero confidence",
+      bl.confidence_from_hit_rate(0.42, 200)[0] == 0.0)
+check("no history earns zero confidence",
+      bl.confidence_from_hit_rate(None, 0)[0] == 0.0)
+c60 = bl.confidence_from_hit_rate(0.60, 10_000)[0]
+check("a 60% hit rate on a large sample approaches 2x(hit-0.5) = 20%",
+      abs(c60 - 0.20) < 0.01, f"got {c60:.4f}")
+check("confidence rises with the hit rate",
+      bl.confidence_from_hit_rate(0.55, 500)[0]
+      < bl.confidence_from_hit_rate(0.65, 500)[0]
+      < bl.confidence_from_hit_rate(0.80, 500)[0])
+check("small samples are shrunk toward zero",
+      bl.confidence_from_hit_rate(0.70, 5)[0] < bl.confidence_from_hit_rate(0.70, 500)[0])
+check("confidence never reaches 100%", bl.confidence_from_hit_rate(1.0, 10_000)[0] <= 0.90)
+
+# A random walk carries no signal, so no engine should earn much confidence on one.
+rng_n = np.random.default_rng(9)
+noise = pd.DataFrame(100 * np.cumprod(1 + rng_n.normal(0, 0.012, size=(T_e, n_e)), axis=0),
+                     index=idx_e, columns=cols_e)
+worst = 0.0
+for eng in ("momentum", "reversal", "trend", "lowvol"):
+    hr_n, nc_n = bl.engine_hit_rate(noise, eng, 252, holding_periods=63)
+    worst = max(worst, bl.confidence_from_hit_rate(hr_n, nc_n)[0])
+check("no engine earns high confidence on a random walk", worst < 0.35, f"worst {worst:.3f}")
+
+# Hit-rate measurement itself must not peek: truncating the future can only
+# remove checks, never change the verdict on the part that overlaps.
+hr_full, n_full = bl.engine_hit_rate(px_e, "momentum", 252, 63)
+hr_part, n_part = bl.engine_hit_rate(px_e.iloc[:1000], "momentum", 252, 63)
+check("hit rate on a shorter history uses fewer checks", n_part < n_full)
+check("hit rates stay in [0,1]", 0.0 <= hr_full <= 1.0 and 0.0 <= hr_part <= 1.0)
+
+# =========================================================
+print()
 if FAILURES:
     print(f"{len(FAILURES)} FAILED: " + ", ".join(FAILURES))
     sys.exit(1)
