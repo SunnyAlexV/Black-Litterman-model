@@ -78,7 +78,9 @@ DEFAULT_RF = 0.04
 DEFAULT_TC_BPS = 15.0
 
 # Recommended defaults for the settings that actually change the answer.
-DEFAULT_MAX_WEIGHT_PCT = 12     # single-stock cap; keeps ~8+ real positions
+DEFAULT_MAX_WEIGHT_PCT = 12     # single-STOCK cap; keeps ~8+ real positions
+DEFAULT_ASSET_CLASS_CAP_PCT = 70  # asset classes: the market really is concentrated,
+                                  # so a tight cap would forbid holding the prior
 DEFAULT_TRAIN_FRAC = 0.45       # leaves a long enough out-of-sample window to mean something
 DEFAULT_VIEW_CONFIDENCE = 75.0  # Idzorek confidence: tilt 75% of the way from market to view
 DEFAULT_VOL_TARGET_PCT = 12.0        # absolute-mode target, when the user picks a fixed number
@@ -417,15 +419,37 @@ def rank_by_liquidity(close, volume, top_n):
 
 @st.cache_data(show_spinner=False)
 def get_market_caps(tickers):
+    """Size of each holding, for the market portfolio the prior is built from.
+
+    For a company that is market capitalisation. For a FUND there is no market
+    cap, so we fall back to net assets (AUM) — and that distinction matters more
+    than it sounds. The obvious alternative, traded value, is badly wrong for
+    ETFs: SPY turns over roughly eighty times more dollars per day than AGG,
+    yet the US bond market is larger than the US equity market. Sizing an
+    asset-class prior by volume produces a "market portfolio" that is 64% SPY
+    and 15% bonds, which is not the market by any definition.
+    """
     caps = {}
     for t in tickers:
+        mc = None
         try:
             fi = yf.Ticker(t).fast_info
-            mc = None
             if fi:
                 mc = fi.get("market_cap") or fi.get("marketCap")
-            caps[t] = float(mc) if mc else np.nan
         except Exception:
+            mc = None
+        if not mc:
+            # Funds: net assets / AUM. Slower (hits .info) but only needed for
+            # the handful of symbols where fast_info has no market cap.
+            try:
+                info = yf.Ticker(t).info or {}
+                mc = (info.get("totalAssets") or info.get("netAssets")
+                      or info.get("totalAsset") or None)
+            except Exception:
+                mc = None
+        try:
+            caps[t] = float(mc) if mc else np.nan
+        except (TypeError, ValueError):
             caps[t] = np.nan
     return caps
 
@@ -612,7 +636,9 @@ def market_weights(tickers, caps, fallback_weights=None):
     if fallback_weights is not None:
         fb = np.asarray(fallback_weights, dtype=float)
         if np.all(np.isfinite(fb)) and fb.sum() > 0:
-            return fb / fb.sum(), "traded value (market caps unavailable)"
+            # Last resort, and a poor one — volume is not size. Flagged loudly
+            # in the UI because a prior built this way is not an equilibrium.
+            return fb / fb.sum(), "traded value (sizes unavailable — see warning)"
 
     return np.repeat(1.0 / n, n), "equal weight (market caps unavailable)"
 
@@ -2541,7 +2567,14 @@ def main():
     ret_freq = hcfg["freq"]; use_log = True; cvar_alpha = 0.95
     tc_bps = market_default(market_name, "tc_bps"); borrow_bps = 50.0; resample_n = 0
     do_backtest = True; train_frac = DEFAULT_TRAIN_FRAC
-    max_weight_pct = DEFAULT_MAX_WEIGHT_PCT
+    # A 12% single-name cap is sensible for 25 stocks and wrong for 13 asset
+    # classes, where the market portfolio itself is legitimately concentrated
+    # (US equity really is a huge share of global assets). Capping at 12% there
+    # forces near-equal-weight and makes every market-relative number
+    # meaningless — active share of 60%+ against a prior you were never allowed
+    # to hold.
+    _is_asset_class = MARKETS[market_name].get("kind") == "asset-class"
+    max_weight_pct = DEFAULT_ASSET_CLASS_CAP_PCT if _is_asset_class else DEFAULT_MAX_WEIGHT_PCT
     use_vol_target = True
     vol_target_mode = "Relative to this portfolio (recommended)"
     vol_target_pct = DEFAULT_VOL_TARGET_PCT
@@ -2616,7 +2649,7 @@ def main():
             g1, g2 = st.columns(2)
             with g1:
                 max_weight_pct = st.slider(
-                    "Max weight per stock (%)", 5, 100, DEFAULT_MAX_WEIGHT_PCT, 1,
+                    "Max weight per holding (%)", 5, 100, max_weight_pct, 1,
                     help="Concentration limit; 100% = no cap. The recommended 12% keeps roughly "
                          "8+ real positions. Without a cap, Max Sharpe will happily put 40% into "
                          "one name. Note a tight cap can also truncate a view's tilt.")
@@ -2730,7 +2763,7 @@ def main():
     native_ccy = MARKETS[market_name]["currency"]
 
     st.info(
-        f"**Here's the plan.** Take the **{top_n} most liquid** stocks in {market_name}, look at how "
+        f"**Here's the plan.** Take the **{top_n} most liquid** "f"{'asset classes' if _is_asset_class else 'stocks'} in {market_name}, look at how "
         f"much of the market each one is, and work backwards to the returns that would justify those "
         f"sizes — that's the equilibrium, and it's your starting portfolio. Then you tell it where you "
         f"disagree, and it moves only as far as your confidence warrants. "
@@ -2902,6 +2935,20 @@ def main():
                        "over the history window. Only used to imply δ.")
         e3.metric("Prior weights from", w_shorten(uni["w_mkt_note"]), help=uni["w_mkt_note"])
 
+        if "traded value" in uni["w_mkt_note"]:
+            _wm = uni["w_mkt"]; _top = int(np.argmax(_wm))
+            st.error(
+                f"**Your prior is built from trading volume, not size — treat it with suspicion.** "
+                f"Sizes were unavailable for these symbols, so the app fell back to traded value, "
+                f"and volume is a poor proxy for how big an asset class is. SPY turns over roughly "
+                f"eighty times more dollars per day than AGG, yet the US bond market is larger than "
+                f"the US equity market. Here that has put **{usable[_top]} at "
+                f"{_wm[_top]*100:,.1f}%** of the 'market'. π = δΣw is only an equilibrium if w is "
+                f"genuinely the market portfolio, so the central claim of the model does not hold "
+                f"on this run. Yahoo usually returns fund net assets on a retry — rebuild the "
+                f"universe, and if it persists, read the results as a constrained optimisation "
+                f"rather than a Black-Litterman equilibrium.")
+
         with st.expander("What the market is implying right now (the prior π)", expanded=False):
             eq_df = pd.DataFrame({
                 "Ticker": usable,
@@ -2986,85 +3033,97 @@ def main():
                     "portfolio subject to your constraints. This is the most defensible output the "
                     "model produces — it rests on no opinion of yours at all.")
 
-        st.markdown("**Your views** — tick *Use* to activate a row. Leave the table empty and you get "
-                    "the pure equilibrium portfolio, which is the correct answer to 'I have no opinion'.")
-        st.caption("**Absolute**: *Asset* will return X% per year (a total return — the app converts it "
-                   "to excess internally). **Relative**: *Asset* will outperform *Versus* by X% per year; "
-                   "*Return %* is the spread, not either leg.")
+        manual_active = view_source.startswith("My own")
+        if manual_active:
+            st.markdown("**Your views** — tick *Use* to activate a row. Leave the table empty and you get "
+                        "the pure equilibrium portfolio, which is the correct answer to 'I have no opinion'.")
+            st.caption("**Absolute**: *Asset* will return X% per year (a total return — the app converts it "
+                       "to excess internally). **Relative**: *Asset* will outperform *Versus* by X% per year; "
+                       "*Return %* is the spread, not either leg.")
 
-        with st.expander("What does Confidence mean? (read this once)", expanded=False):
-            st.markdown(
-                "**Confidence is not a statistical confidence interval.** It is not a 95%-significance "
-                "thing, and it says nothing about probability. It is a *blending weight* between two "
-                "opinions: the market's and yours.\n\n"
-                "Under Idzorek, the posterior obeys a rule you can do in your head:\n\n"
-                "> **shift in expected return = confidence × (your view − what the equilibrium already implied)**\n\n"
-                "So if the equilibrium says a stock earns 11% and you say 16%, your view is a **5pp "
-                "surprise**. Then:\n\n"
-                "- **0%** — ignore me, keep the market's number (11%).\n"
-                "- **25%** — nudge it to 12.25%.\n"
-                "- **50%** — split the difference, 13.5%.\n"
-                "- **75%** — mostly believe me, 14.75%. *(recommended default)*\n"
-                "- **100%** — the market is simply wrong, use 16%.\n\n"
-                "Two consequences worth internalising. First, **a view that agrees with the equilibrium "
-                "does nothing at any confidence** — if the surprise is zero, so is the shift. Check the "
-                "*Surprise* column after building. Second, **confidence is not free**: at 75% a wrong "
-                "view loses you money three times faster than at 25%. It is a statement about how much "
-                "you are willing to be wrong by, not a dial that makes returns bigger.")
-        if mode != "Advanced":
-            st.caption(f"Confidence defaults to **{DEFAULT_VIEW_CONFIDENCE:,.0f}%** — the recommended "
-                       f"starting point. Edit the column to change it per view.")
+            with st.expander("What does Confidence mean? (read this once)", expanded=False):
+                st.markdown(
+                    "**Confidence is not a statistical confidence interval.** It is not a 95%-significance "
+                    "thing, and it says nothing about probability. It is a *blending weight* between two "
+                    "opinions: the market's and yours.\n\n"
+                    "Under Idzorek, the posterior obeys a rule you can do in your head:\n\n"
+                    "> **shift in expected return = confidence × (your view − what the equilibrium already implied)**\n\n"
+                    "So if the equilibrium says a stock earns 11% and you say 16%, your view is a **5pp "
+                    "surprise**. Then:\n\n"
+                    "- **0%** — ignore me, keep the market's number (11%).\n"
+                    "- **25%** — nudge it to 12.25%.\n"
+                    "- **50%** — split the difference, 13.5%.\n"
+                    "- **75%** — mostly believe me, 14.75%. *(recommended default)*\n"
+                    "- **100%** — the market is simply wrong, use 16%.\n\n"
+                    "Two consequences worth internalising. First, **a view that agrees with the equilibrium "
+                    "does nothing at any confidence** — if the surprise is zero, so is the shift. Check the "
+                    "*Surprise* column after building. Second, **confidence is not free**: at 75% a wrong "
+                    "view loses you money three times faster than at 25%. It is a statement about how much "
+                    "you are willing to be wrong by, not a dial that makes returns bigger.")
+            if mode != "Advanced":
+                st.caption(f"Confidence defaults to **{DEFAULT_VIEW_CONFIDENCE:,.0f}%** — the recommended "
+                           f"starting point. Edit the column to change it per view.")
 
-        # st.data_editor holds its own state against its key, so replacing the
-        # underlying DataFrame is not enough to refresh it — the key itself has
-        # to change. Hence the version counter bumped by the buttons below.
-        vkey = f"views_df_{sig}"
-        vver_key = f"views_ver_{sig}"
-        if vkey not in st.session_state:
-            st.session_state[vkey] = blank_views(usable, 3)
-        st.session_state.setdefault(vver_key, 0)
+            # st.data_editor holds its own state against its key, so replacing the
+            # underlying DataFrame is not enough to refresh it — the key itself has
+            # to change. Hence the version counter bumped by the buttons below.
+            vkey = f"views_df_{sig}"
+            vver_key = f"views_ver_{sig}"
+            if vkey not in st.session_state:
+                st.session_state[vkey] = blank_views(usable, 3)
+            st.session_state.setdefault(vver_key, 0)
 
-        sug1, sug2, _sp = st.columns([1, 1, 3])
-        with sug1:
-            if st.button("📈 Suggest momentum views",
-                         help="Fills the table with a couple of relative views built from 12-1 month "
-                              "momentum, at a deliberately modest confidence. This is a worked example "
-                              "of how to fill the table in, not a recommendation."):
-                mv = _momentum_views(uni)
-                if mv is not None:
-                    st.session_state[vkey] = mv
+            sug1, sug2, _sp = st.columns([1, 1, 3])
+            with sug1:
+                if st.button("📈 Suggest momentum views",
+                             help="Fills the table with a couple of relative views built from 12-1 month "
+                                  "momentum, at a deliberately modest confidence. This is a worked example "
+                                  "of how to fill the table in, not a recommendation."):
+                    mv = _momentum_views(uni)
+                    if mv is not None:
+                        st.session_state[vkey] = mv
+                        st.session_state[vver_key] += 1
+                        st.rerun()
+                    else:
+                        st.warning("Not enough price history to build momentum views.")
+            with sug2:
+                if st.button("🧹 Clear views"):
+                    st.session_state[vkey] = blank_views(usable, 3)
                     st.session_state[vver_key] += 1
                     st.rerun()
-                else:
-                    st.warning("Not enough price history to build momentum views.")
-        with sug2:
-            if st.button("🧹 Clear views"):
-                st.session_state[vkey] = blank_views(usable, 3)
-                st.session_state[vver_key] += 1
-                st.rerun()
 
-        edited = st.data_editor(
-            st.session_state[vkey],
-            key=f"views_editor_{sig}_{st.session_state[vver_key]}", num_rows="dynamic",
-            hide_index=True, width='stretch',
-            column_config={
-                "Use": st.column_config.CheckboxColumn("Use", help="Activate this view", default=False),
-                "Type": st.column_config.SelectboxColumn("Type", options=VIEW_TYPES, required=True),
-                "Asset": st.column_config.SelectboxColumn("Asset", options=usable, required=True),
-                "Versus": st.column_config.SelectboxColumn(
-                    "Versus", options=usable,
-                    help="Only used for Relative views — the asset you expect to underperform"),
-                "Return % p.a.": st.column_config.NumberColumn(
-                    "Return % p.a.", format="%.2f", step=0.5,
-                    help="Absolute: the total annual return. Relative: the annual outperformance."),
-                "Confidence %": st.column_config.NumberColumn(
-                    "Confidence %", min_value=0.0, max_value=100.0, step=5.0, format="%.0f"),
-            })
-        st.session_state[vkey] = edited
+            edited = st.data_editor(
+                st.session_state[vkey],
+                key=f"views_editor_{sig}_{st.session_state[vver_key]}", num_rows="dynamic",
+                hide_index=True, width='stretch',
+                column_config={
+                    "Use": st.column_config.CheckboxColumn("Use", help="Activate this view", default=False),
+                    "Type": st.column_config.SelectboxColumn("Type", options=VIEW_TYPES, required=True),
+                    "Asset": st.column_config.SelectboxColumn("Asset", options=usable, required=True),
+                    "Versus": st.column_config.SelectboxColumn(
+                        "Versus", options=usable,
+                        help="Only used for Relative views — the asset you expect to underperform"),
+                    "Return % p.a.": st.column_config.NumberColumn(
+                        "Return % p.a.", format="%.2f", step=0.5,
+                        help="Absolute: the total annual return. Relative: the annual outperformance."),
+                    "Confidence %": st.column_config.NumberColumn(
+                        "Confidence %", min_value=0.0, max_value=100.0, step=5.0, format="%.0f"),
+                })
+            st.session_state[vkey] = edited
 
-        if omega_method == "He-Litterman proportional":
-            st.caption("Ω method is He-Litterman, so the **Confidence column is ignored** — each view's "
-                       "uncertainty is taken straight from the prior.")
+            if omega_method == "He-Litterman proportional":
+                st.caption("Ω method is He-Litterman, so the **Confidence column is ignored** — each view's "
+                           "uncertainty is taken straight from the prior.")
+
+        else:
+            # Rule-driven or pure-equilibrium: keep whatever the user typed
+            # in session state, but do not render a ticked 75%-confidence
+            # table while something else is actually driving the portfolio.
+            vkey = f"views_df_{sig}"
+            edited = st.session_state.get(vkey, blank_views(usable, 3))
+            if bool(np.asarray(edited.get("Use", pd.Series(dtype=bool))).sum()):
+                st.caption("You have manual views saved. They are **not** being used — "
+                           "switch the source above to *My own views* to activate them.")
 
         # ---------------- BUILD ----------------
         if st.button("② Build portfolio", type="primary"):
