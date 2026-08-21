@@ -1,0 +1,10 @@
+# Streamlit Community Cloud picks this up automatically.
+[theme]
+base = "dark"
+
+[server]
+# The app fetches a lot of tickers on first load; give it room.
+maxUploadSize = 20
+
+[browser]
+gatherUsageStats = false
