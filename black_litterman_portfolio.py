@@ -1524,6 +1524,36 @@ def vol_target_scale(past_returns, target_vol, freq_per_year, lookback,
     return float(np.clip(k, min_scale, max_leverage))
 
 
+def buy_and_hold_returns(R, w):
+    """Period returns of a basket bought at weights `w` and then LEFT ALONE.
+
+    The obvious-looking `R @ w` is not this. Applying a fixed weight vector to
+    every period silently rebalances the portfolio back to `w` every single
+    period — so a 'yearly rebalanced' strategy computed that way is really a
+    daily-rebalanced one that happens to re-optimise once a year, and every
+    rebalance frequency collapses to nearly the same result.
+
+    Here the holdings drift: each asset's value compounds at its own return, and
+    the portfolio return is the change in the total.
+    """
+    R = np.asarray(R, dtype=float)
+    w = np.asarray(w, dtype=float)
+    if R.size == 0:
+        return np.zeros(0), w.copy()
+    growth = np.cumprod(1.0 + R, axis=0)          # per-asset value path
+    V = growth @ w                                # portfolio value path, V(0-)=1
+    prev = np.concatenate(([float(np.sum(w))], V[:-1]))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        r = np.where(np.abs(prev) > 1e-12, V / prev - 1.0, 0.0)
+    # weights the portfolio has DRIFTED to by the end — what the next rebalance
+    # actually trades away from, and therefore what turnover must be measured
+    # against.
+    end_val = w * growth[-1]
+    tot = float(np.sum(end_val))
+    w_end = end_val / tot if abs(tot) > 1e-12 else w.copy()
+    return r, w_end
+
+
 def run_backtest(prices, freq, use_log, mu_builder, cov_method, freq_per_year, rf,
                  stance, max_weight, gross_limit, objective, alpha,
                  tc_bps, borrow_bps, train_frac, resample_n,
@@ -1614,10 +1644,13 @@ def run_backtest(prices, freq, use_log, mu_builder, cov_method, freq_per_year, r
         turnover = float(np.sum(np.abs(w - prev_w)))
         turnover_sum += turnover
         n_rebalances += 1
-        prev_w = w
 
         end_j = min(i + rebalance_periods, T)
-        seg = (R_simple.iloc[i:end_j].values @ w).astype(float)      # native
+        # Buy the target weights, then LET THEM DRIFT until the next rebalance.
+        # `w_drift` is where the portfolio actually ends up, and is what the next
+        # rebalance trades away from.
+        seg, w_drift = buy_and_hold_returns(R_simple.iloc[i:end_j].values, w)
+        seg = seg.astype(float)
         seg -= borrow_frac * float(np.sum(np.clip(-w, 0, None))) / freq_per_year
         if len(seg):
             seg[0] -= tc_frac * turnover
@@ -1663,6 +1696,7 @@ def run_backtest(prices, freq, use_log, mu_builder, cov_method, freq_per_year, r
 
         pnl_unscaled.extend(seg_report.tolist())        # same strategy, always fully invested
         dates.extend(list(R_simple.index[i:end_j]))
+        prev_w = w_drift                                # what we actually hold now
         i = end_j
 
     if not pnl:
@@ -1670,7 +1704,7 @@ def run_backtest(prices, freq, use_log, mu_builder, cov_method, freq_per_year, r
 
     m = len(pnl)
     wb = np.repeat(1.0 / n, n)
-    pb_native = R_simple.iloc[start_i:start_i + m].values @ wb
+    pb_native, _ = buy_and_hold_returns(R_simple.iloc[start_i:start_i + m].values, wb)
     pb = to_report(pb_native, start_i, start_i + m)                  # equal-weight, reporting ccy
 
     strat = perf_metrics(np.array(pnl), freq_per_year, rf)
@@ -1684,7 +1718,8 @@ def run_backtest(prices, freq, use_log, mu_builder, cov_method, freq_per_year, r
     if caps_weights is not None:
         wm = np.asarray(caps_weights, dtype=float)
         if wm.shape[0] == n and np.isfinite(wm).all():
-            pm_native = R_simple.iloc[start_i:start_i + m].values @ wm
+            pm_native, _ = buy_and_hold_returns(
+                R_simple.iloc[start_i:start_i + m].values, wm)
             market_perf = perf_metrics(to_report(pm_native, start_i, start_i + m),
                                        freq_per_year, rf)
 
