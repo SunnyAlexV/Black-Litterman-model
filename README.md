@@ -121,21 +121,29 @@ The app is built to tell you when its own output is unreliable:
 
 Nine markets (S&P 500, FTSE 350, HDAX, SBF 120, Nikkei 225, Nifty 500, S&P/TSX, ASX 200, Hang Seng), automatic liquidity screening, Simple and Advanced modes, an interactive Plotly efficient frontier with click-through allocations, a walk-forward out-of-sample backtest that re-derives the equilibrium at every rebalance, FX conversion, board-lot rounding, an executable trade list with CSV export, and run-to-run comparison.
 
-### History windows — all three horizons estimate from the same data
+### History windows — all three horizons see identical data
 
-How long you intend to *hold* and how much history you should *estimate from* are different questions, and conflating them was a real flaw in an earlier version: choosing "weekly" quietly cut the estimation window to two years and left the covariance matrix — and therefore π = δΣw — running on fumes. Wanting to trade weekly is a preference; how much data Σ needs is a statistical fact.
+How long you intend to *hold* and how much history you should *estimate from* are different questions, and conflating them was a real flaw in an earlier version: choosing "weekly" quietly cut the estimation window to two years and left the covariance matrix — and therefore π = δΣw — running on fumes. A later version fixed the window but still gave the yearly horizon weekly returns, so it saw 780 observations where the others saw 3,780.
 
-So the horizon now sets **only** the return frequency and the rebalance period. Every horizon estimates from the same long window:
+Both are now decoupled. Every horizon estimates from the same 15-year daily history and differs **only** in how often it rebalances:
 
-| Horizon | Estimation window | Frequency | Rebalances | Observations per asset |
+| Horizon | Estimation window | Returns | Rebalances | Observations |
 |---|---|---|---|---|
-| Weekly — short-term | up to 15 years | daily | every 5 days | ~150 |
-| Monthly — medium-term | up to 15 years | daily | every 21 days | ~150 |
-| Yearly — long-term | up to 15 years | weekly | every 52 weeks | ~30–60 |
+| Weekly — short-term | up to 15 years | daily | ~50/year | ~3,780 |
+| Monthly — medium-term | up to 15 years | daily | ~12/year | ~3,780 |
+| Yearly — long-term | up to 15 years | daily | ~1/year | ~3,780 |
 
-**The window is chosen from the data, not imposed.** Demanding a fixed 15 years would silently discard every asset younger than that — half a Nifty universe in practice — while a naive `dropna()` would truncate *every* asset to the youngest one's history. Instead the app walks the window down from 15 years and stops at the longest length that still supports a full-sized universe and clears an observations-per-asset bar, backfilling any excluded names from the next most liquid long-lived candidates. A universe where nothing is old shortens the window gracefully rather than failing.
+Neither setting is the "good" one. More rebalances give more decisions to judge the strategy on and cost more in turnover; fewer give a cleaner read on the long-run allocation from a smaller sample of decisions. The app says exactly that and does not steer.
+
+**The window is chosen from the data, not imposed.** Demanding a fixed 15 years would silently discard every asset younger than that — half a Nifty universe in practice — while a naive `dropna()` would truncate *every* asset to the youngest one's history. Instead the app walks the window down from 15 years and stops at the longest length that still supports a full-sized universe, backfilling excluded names from the next most liquid long-lived candidates. A universe where nothing is old shortens the window gracefully rather than failing.
 
 Why longer helps where it does: Σ's estimation error falls roughly as 1/√T, and since the prior is built from Σ, a better Σ means a better prior rather than merely better risk numbers. It helps far less with anything mean-like — a sample mean's standard error is driven by volatility, not sample length — which is precisely why Black-Litterman does not estimate expected returns from history in the first place.
+
+### On reading the output
+
+The app reports a **model-implied** annual return, not a forecast. It is what the posterior implies for the chosen weights, and the posterior is built from today's market capitalisations and a historical covariance matrix — neither of which predicts anything. The backtest is the only figure carrying a predictive claim, and it is a single historical path.
+
+Where the app compares things, it states both sides of the trade rather than declaring a winner. The volatility overlay, for instance, reduced drawdown in most simulated runs and moved the Sharpe ratio in either direction about equally often — so the app reports the risk reduction as the expected effect and any Sharpe gain as that window's luck.
 
 ### Per-market recommended settings
 
@@ -160,7 +168,7 @@ On Windows, if `streamlit` isn't on your PATH, use `python -m streamlit run blac
 python test_bl_core.py
 ```
 
-96 headless checks covering the numeric core, with Streamlit and yfinance stubbed so nothing needs a server or a network connection. They check reverse optimisation round-trips, that the two posterior formulas agree, Ω construction under both methods, view parsing and excess-return conversion, τ invariance, confidence linearity, the volatility overlay's no-look-ahead property, the negative-Sharpe artifact, the share allocator (never overspends, respects board lots, strands less than one lot), the relative volatility target, the systematic view engines — both proven free of look-ahead by divergent-futures tests — and the adaptive history window.
+99 headless checks covering the numeric core, with Streamlit and yfinance stubbed so nothing needs a server or a network connection. They check reverse optimisation round-trips, that the two posterior formulas agree, Ω construction under both methods, view parsing and excess-return conversion, τ invariance, confidence linearity, the volatility overlay's no-look-ahead property, the negative-Sharpe artifact, the share allocator (never overspends, respects board lots, strands less than one lot), the relative volatility target, the systematic view engines — both proven free of look-ahead by divergent-futures tests — and the adaptive history window.
 
 Two properties worth knowing about, both locked down by tests:
 
