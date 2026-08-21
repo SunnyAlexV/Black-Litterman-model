@@ -182,6 +182,37 @@ def lot_size_for(ticker):
 # MARKET / INDEX UNIVERSES
 # =========================================================
 MARKETS = {
+    # ---- Asset-class universes -------------------------------------------
+    # These fix the deepest flaw in the stock universes below. Black-Litterman
+    # needs w to be THE market portfolio; a hand-picked slice of 25 large caps
+    # is not one, and picking today's most liquid names and back-testing them
+    # imports the answer (survivorship + selection bias). An ETF spanning an
+    # asset class has none of that: it existed throughout, and constituent
+    # churn is handled inside the fund. This is also the problem Black and
+    # Litterman (1992) actually wrote about — global allocation across markets,
+    # not stock selection.
+    "Global multi-asset (ETFs)": {"currency": "USD", "kind": "asset-class", "tickers": [
+        "SPY",    # US large cap equity
+        "IWM",    # US small cap equity
+        "EFA",    # developed ex-US equity
+        "EEM",    # emerging market equity
+        "AGG",    # US aggregate bonds
+        "TLT",    # US long treasuries
+        "IEF",    # US intermediate treasuries
+        "LQD",    # investment grade credit
+        "HYG",    # high yield credit
+        "TIP",    # inflation-linked
+        "GLD",    # gold
+        "DBC",    # broad commodities
+        "VNQ",    # US real estate
+    ]},
+    "US sectors (ETFs)": {"currency": "USD", "kind": "asset-class", "tickers": [
+        "XLK", "XLF", "XLV", "XLY", "XLP", "XLE",
+        "XLI", "XLB", "XLU", "XLRE", "XLC",
+    ]},
+    "Global equity regions (ETFs)": {"currency": "USD", "kind": "asset-class", "tickers": [
+        "SPY", "IWM", "EFA", "EEM", "EWJ", "EWU", "EWG", "EWY", "EWZ", "INDA", "FXI", "EWC",
+    ]},
     "United States — S&P 500": {"currency": "USD", "tickers": [
         "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "GOOG", "META", "TSLA", "BRK-B", "JPM",
         "V", "MA", "UNH", "HD", "PG", "JNJ", "XOM", "CVX", "KO", "PEP",
@@ -729,6 +760,214 @@ def build_pq(views_df, tickers, rf):
 # ---------------------------------------------------------
 # Omega — how uncertain each view is
 # ---------------------------------------------------------
+# =========================================================
+# SYSTEMATIC VIEW ENGINES
+# =========================================================
+# Typed views cannot be tested. You form them today, so applying them to 2022
+# is look-ahead bias — which is why the backtest can only ever run views-off.
+# A RULE can be evaluated at every rebalance using only the data available at
+# that moment, so the backtest can finally answer the question that matters:
+# do views add anything at all?
+#
+# Every engine here is a pure function of a price history. Give it prices up to
+# time t and it returns views as of time t. Nothing else. That property is what
+# makes the whole thing honest, and it is enforced by a test.
+
+VIEW_ENGINES = {
+    "None — pure equilibrium": None,
+    "Momentum (12-1)": "momentum",
+    "Short-term reversal (1m)": "reversal",
+    "Trend (price vs 200d)": "trend",
+    "Low volatility": "lowvol",
+}
+
+ENGINE_NOTES = {
+    "momentum": ("Ranks assets on their return over the past 12 months, skipping the most "
+                 "recent month (the skip avoids short-term reversal contaminating the signal). "
+                 "Expects past winners to keep beating past losers. The most robust anomaly in "
+                 "the literature, and also among the most crowded."),
+    "reversal": ("Ranks on the last month's return and bets the other way — recent losers "
+                 "bounce. Works at short horizons where momentum does not, and is the reason "
+                 "momentum skips the most recent month."),
+    "trend": ("Compares each asset's price to its own 200-day average. Above = hold, below = "
+              "expect weakness. A time-series signal rather than a cross-sectional one: it can "
+              "be bearish on everything at once."),
+    "lowvol": ("Ranks on realised volatility and expects the calmer assets to deliver better "
+               "risk-adjusted returns — the low-volatility anomaly. Note this partly duplicates "
+               "what the optimiser already does, so its views often add little."),
+}
+
+
+def _engine_scores(prices, engine, freq_per_year):
+    """Per-asset attractiveness score from price history alone. Higher = more attractive.
+
+    `prices` must contain ONLY data the model is allowed to see at this point.
+    Returns (scores, ok) where ok is False when there is not enough history.
+    """
+    px = prices.dropna(how="all")
+    n_obs = len(px)
+    per_month = max(1, int(round(freq_per_year / 12)))
+    if n_obs < 3 * per_month:
+        return None, False
+
+    if engine == "momentum":
+        look = min(n_obs - 1, 12 * per_month)
+        skip = per_month
+        if look - skip < per_month:
+            return None, False
+        s = px.iloc[-1 - skip] / px.iloc[-look] - 1.0
+    elif engine == "reversal":
+        look = min(n_obs - 1, per_month)
+        s = -(px.iloc[-1] / px.iloc[-1 - look] - 1.0)          # negative: losers score high
+    elif engine == "trend":
+        win = min(n_obs, max(20, int(round(freq_per_year * 200 / 252))))
+        ma = px.iloc[-win:].mean()
+        s = px.iloc[-1] / ma - 1.0
+    elif engine == "lowvol":
+        win = min(n_obs - 1, 6 * per_month)
+        r = px.iloc[-(win + 1):].pct_change().dropna()
+        if len(r) < 5:
+            return None, False
+        s = -(r.std(ddof=1) * math.sqrt(freq_per_year))         # negative: calm scores high
+    else:
+        return None, False
+
+    s = s.replace([np.inf, -np.inf], np.nan).dropna()
+    if len(s) < 2:
+        return None, False
+    return s, True
+
+
+def systematic_views(prices, tickers, engine, freq_per_year, n_pairs=2,
+                     damping=0.30, max_spread=0.20, conf=None):
+    """Build (P, Q, conf, labels) from a rule, using only `prices`.
+
+    Cross-sectional engines (momentum, reversal, lowvol) produce RELATIVE views
+    pairing the best-ranked asset against the worst. `trend` produces ABSOLUTE
+    views on the strongest and weakest names, because it is a time-series signal
+    and can legitimately be negative on everything at once.
+
+    Q is damped: the raw spread between winners and losers is a backward-looking
+    number and taking it at face value would be absurdly aggressive. `damping`
+    scales it down and `max_spread` caps it.
+    """
+    n = len(tickers)
+    empty = (np.zeros((0, n)), np.zeros(0), np.zeros(0), [])
+    if engine is None:
+        return empty
+
+    scores, ok = _engine_scores(prices[tickers], engine, freq_per_year)
+    if not ok:
+        return empty
+
+    order = scores.sort_values(ascending=False)
+    names = list(order.index)
+    idx = {t: i for i, t in enumerate(tickers)}
+    k = min(int(n_pairs), len(names) // 2)
+    if k < 1:
+        return empty
+
+    P, Q, labels = [], [], []
+    for j in range(k):
+        win, lose = names[j], names[-(j + 1)]
+        if win == lose:
+            continue
+        raw = float(order.iloc[j] - order.iloc[-(j + 1)])
+        q = float(np.clip(raw * damping, -max_spread, max_spread))
+        if abs(q) < 1e-6:
+            continue
+        if engine == "trend":
+            # absolute views: the strongest gets a positive tilt, the weakest a
+            # negative one, both relative to the risk-free rate (excess space).
+            p_up = np.zeros(n); p_up[idx[win]] = 1.0
+            P.append(p_up); Q.append(abs(q) * 0.5)
+            labels.append(f"{win} above its 200d average — expect +{abs(q)*50:,.2f}% excess")
+            p_dn = np.zeros(n); p_dn[idx[lose]] = 1.0
+            P.append(p_dn); Q.append(-abs(q) * 0.5)
+            labels.append(f"{lose} below its 200d average — expect {-abs(q)*50:,.2f}% excess")
+        else:
+            p = np.zeros(n); p[idx[win]] = 1.0; p[idx[lose]] = -1.0
+            P.append(p); Q.append(q)
+            labels.append(f"{win} outperforms {lose} by {q*100:,.2f}% [{engine}]")
+
+    if not P:
+        return empty
+    c = 0.5 if conf is None else float(conf)
+    return (np.array(P), np.array(Q), np.full(len(P), c), labels)
+
+
+def engine_hit_rate(prices, engine, freq_per_year, holding_periods,
+                    n_pairs=2, max_checks=60):
+    """How often has this rule been directionally right, out of sample?
+
+    Walks forward through the history: at each step, form the view using only
+    prices up to that point, then check the SIGN of what actually happened over
+    the following `holding_periods`. Never looks beyond the point being tested.
+
+    Returns (hit_rate, n_checks). A rule with no information lands at 0.5.
+    """
+    px = prices.dropna(how="all")
+    T = len(px)
+    hp = max(1, int(holding_periods))
+    per_month = max(1, int(round(freq_per_year / 12)))
+    warm = 13 * per_month                      # momentum needs 12m + 1m skip
+    if T < warm + hp + 5:
+        return None, 0
+
+    step = max(hp, (T - warm - hp) // max_checks + 1)
+    hits = total = 0
+    for t in range(warm, T - hp, step):
+        hist = px.iloc[:t]
+        scores, ok = _engine_scores(hist, engine, freq_per_year)
+        if not ok:
+            continue
+        order = scores.sort_values(ascending=False)
+        names = list(order.index)
+        k = min(int(n_pairs), len(names) // 2)
+        for j in range(k):
+            win, lose = names[j], names[-(j + 1)]
+            if win == lose:
+                continue
+            try:
+                fwd_w = px[win].iloc[t + hp] / px[win].iloc[t] - 1.0
+                fwd_l = px[lose].iloc[t + hp] / px[lose].iloc[t] - 1.0
+            except Exception:
+                continue
+            if not (np.isfinite(fwd_w) and np.isfinite(fwd_l)):
+                continue
+            predicted_up = True if engine != "trend" else (float(order.iloc[j]) > 0)
+            realised_up = (fwd_w - fwd_l) > 0
+            hits += int(realised_up == predicted_up)
+            total += 1
+    if total == 0:
+        return None, 0
+    return hits / total, total
+
+
+def confidence_from_hit_rate(hit_rate, n_checks, shrink_k=25.0, cap=0.90):
+    """Turn a realised hit rate into an Idzorek confidence.
+
+    A rule that is right half the time carries no information, so it should get
+    ZERO confidence and be ignored by the posterior. Hence:
+
+        confidence = 2 * (hit_rate - 0.5)
+
+    A 50% hit rate gives 0%; 60% gives 20%; 75% gives 50%. Then shrink toward
+    zero when the sample is small — twelve observations of a 70% hit rate is
+    not evidence — and cap below 100% because no rule deserves certainty.
+    """
+    if hit_rate is None or n_checks <= 0:
+        return 0.0, "no history — view ignored"
+    raw = 2.0 * (float(hit_rate) - 0.5)
+    if raw <= 0:
+        return 0.0, (f"hit rate {hit_rate*100:,.0f}% over {n_checks} checks — no better than "
+                     f"chance, so the view is ignored")
+    shrunk = raw * (n_checks / (n_checks + shrink_k))
+    c = float(np.clip(shrunk, 0.0, cap))
+    return c, (f"hit rate {hit_rate*100:,.0f}% over {n_checks} checks → confidence "
+               f"{c*100:,.0f}% (shrunk for sample size)")
+
+
 def omega_he_litterman(P, Sigma, tau):
     """Omega = diag(P (tau Sigma) P').  The classic choice: a view is assumed to
     be exactly as uncertain as the prior is about that same combination of
@@ -1944,7 +2183,41 @@ def _render_backtest(res, bt, bt_eq=None):
                 + (f", of which **{-overlay_cost*100:+,.2f}pp** is the volatility overlay, "
                    f"leaving **{gap_ex_overlay*100:+,.2f}pp** from the model itself."
                    if bt.get("vt_applied") else "."))
-            if not res.get("backtest_uses_views"):
+            if res.get("sys_engine") and bt_eq is not None:
+                # The one comparison in this whole app that answers "do views
+                # add value?" with evidence rather than assertion.
+                r_rule = s["ann_ret"]; r_eq = bt_eq["strat"]["ann_ret"]
+                sh_rule = s["sharpe"]; sh_eq = bt_eq["strat"]["sharpe"]
+                d_r = r_rule - r_eq
+                st.markdown("##### Did the rule add anything?")
+                q1, q2, q3 = st.columns(3)
+                q1.metric(f"Rule: {res['sys_engine']}", f"{r_rule*100:,.2f}%/yr",
+                          delta=f"{d_r*100:+,.2f}pp vs no views")
+                q2.metric("Pure equilibrium", f"{r_eq*100:,.2f}%/yr")
+                q3.metric("Sharpe", f"{sh_rule:,.2f}",
+                          delta=f"{sh_rule - sh_eq:+,.2f} vs no views")
+                if abs(d_r) < 0.002:
+                    st.info(
+                        f"**The rule made essentially no difference** ({d_r*100:+,.2f}pp a year). "
+                        f"Usually because it earned little confidence, so the posterior barely "
+                        f"moved off the prior — which is the model correctly declining to act on "
+                        f"a weak signal.")
+                elif d_r > 0:
+                    st.success(
+                        f"**The rule added {d_r*100:,.2f}pp a year over pure equilibrium.** This is "
+                        f"a real out-of-sample result: the views were rebuilt from scratch at every "
+                        f"rebalance using only data available then, and the confidence was "
+                        f"recalibrated from the rule's hit rate at that point. No look-ahead. "
+                        f"One historical path, though — not proof the edge persists.")
+                else:
+                    st.warning(
+                        f"**The rule cost {abs(d_r)*100:,.2f}pp a year versus doing nothing.** That "
+                        f"is a legitimate finding and worth reporting as-is. Most systematic signals "
+                        f"fail this test; it is why the equilibrium anchor does the heavy lifting in "
+                        f"Black-Litterman. Do not cycle through rules until one looks good — that "
+                        f"search is itself how backtest overfitting happens.")
+
+            if not res.get("backtest_uses_views") and not res.get("sys_engine"):
                 st.info(
                     "**Note what this backtest actually tests.** Your views are not applied here "
                     "(switching them on would be look-ahead bias), so the strategy is the *pure "
@@ -2644,6 +2917,75 @@ def main():
                        "last two columns: the historical means are wild, π is smooth and ranks assets "
                        "by their contribution to market risk. That smoothness is the whole point.")
 
+        # ---------------- where do the views come from? ----------------
+        st.markdown("**Where should the views come from?**")
+        view_source = st.radio(
+            "Views source", ["Systematic rule (recommended)", "My own views", "None — pure equilibrium"],
+            index=0, horizontal=True, label_visibility="collapsed",
+            help="A SYSTEMATIC RULE can be tested: it is a function of past prices, so the "
+                 "backtest can rebuild it at every rebalance and measure whether it added "
+                 "anything. YOUR OWN VIEWS cannot be tested — you formed them today, so "
+                 "applying them to past trades is look-ahead bias. NONE gives the pure "
+                 "equilibrium, which is the correct answer to 'I have no opinion'.")
+
+        sys_engine = None
+        sys_n_pairs = 2
+        sys_conf = 0.0
+        sys_conf_note = ""
+        sys_labels = []
+
+        if view_source.startswith("Systematic"):
+            s1, s2 = st.columns([2, 1])
+            with s1:
+                engine_name = st.selectbox("Rule", [k for k in VIEW_ENGINES if VIEW_ENGINES[k]],
+                                           index=0)
+                sys_engine = VIEW_ENGINES[engine_name]
+            with s2:
+                sys_n_pairs = st.slider("Views to generate", 1, 4, 2, 1,
+                                        help="Each view pairs the best-ranked asset against the "
+                                             "worst. More views means more tilt and more ways to "
+                                             "be wrong.")
+            st.caption(ENGINE_NOTES.get(sys_engine, ""))
+
+            with st.spinner("Measuring how often this rule has been right..."):
+                hr, nchecks = engine_hit_rate(uni["prices"], sys_engine, uni["freq_per_year"],
+                                              holding_periods=hcfg["rebal"], n_pairs=sys_n_pairs)
+                sys_conf, sys_conf_note = confidence_from_hit_rate(hr, nchecks)
+                Ps, Qs, cs, sys_labels = systematic_views(
+                    uni["prices"], usable, sys_engine, uni["freq_per_year"],
+                    n_pairs=sys_n_pairs, conf=sys_conf)
+
+            h1, h2, h3 = st.columns(3)
+            h1.metric("Historical hit rate", f"{hr*100:,.0f}%" if hr is not None else "—",
+                      help="How often this rule got the direction right, walking forward through "
+                           "your history window using only data available at each point.")
+            h2.metric("Checks", f"{nchecks}",
+                      help="Independent out-of-sample observations behind that hit rate.")
+            h3.metric("Confidence assigned", f"{sys_conf*100:,.0f}%",
+                      help="confidence = 2 x (hit rate - 50%), shrunk for sample size. A rule that "
+                           "is right half the time carries no information and gets zero.")
+
+            if sys_conf <= 0.001:
+                st.warning(
+                    f"**This rule earns zero confidence, so it will change nothing.** {sys_conf_note}. "
+                    f"That is the model working correctly, not a failure — a signal that is right "
+                    f"half the time should not move your portfolio. Try another rule, or accept the "
+                    f"pure equilibrium as the answer.")
+            else:
+                st.success(f"**{sys_conf_note}.** The views below were generated from prices alone "
+                           f"and will be rebuilt at every rebalance in the backtest, so the result "
+                           f"is a genuine out-of-sample test of the rule.")
+
+            if sys_labels:
+                st.dataframe(pd.DataFrame({"Generated view": sys_labels,
+                                           "Confidence %": [sys_conf * 100] * len(sys_labels)}),
+                             hide_index=True, width='stretch')
+
+        elif view_source.startswith("None"):
+            st.info("**Pure equilibrium.** The posterior equals the prior, so you get the market "
+                    "portfolio subject to your constraints. This is the most defensible output the "
+                    "model produces — it rests on no opinion of yours at all.")
+
         st.markdown("**Your views** — tick *Use* to activate a row. Leave the table empty and you get "
                     "the pure equilibrium portfolio, which is the correct answer to 'I have no opinion'.")
         st.caption("**Absolute**: *Asset* will return X% per year (a total return — the app converts it "
@@ -2733,7 +3075,18 @@ def main():
             Sigma = cov.values
             w_mkt = uni["w_mkt"]
 
-            P, Q, conf, view_labels, view_errors = build_pq(edited, usable, rf)
+            if sys_engine is not None:
+                # Rule-driven: P, Q and the confidence all come from price history.
+                # Nothing here is a judgement call the user could get wrong.
+                P, Q, conf, view_labels = systematic_views(
+                    uni["prices"], usable, sys_engine, uni["freq_per_year"],
+                    n_pairs=sys_n_pairs, conf=sys_conf)
+                view_errors = []
+            elif view_source.startswith("None"):
+                P, Q, conf = np.zeros((0, len(usable))), np.zeros(0), np.zeros(0)
+                view_labels, view_errors = [], []
+            else:
+                P, Q, conf, view_labels, view_errors = build_pq(edited, usable, rf)
             for e in view_errors:
                 st.warning(e)
 
@@ -2752,7 +3105,8 @@ def main():
                 f"({delta_note}) · Σ: {cov_method}"
                 f"{' + posterior M' if use_posterior_cov else ''} · {ret_freq} "
                 f"{'log' if use_log else 'simple'} returns · rf {rf*100:,.2f}% · "
-                f"{len(view_labels)} active view(s) · "
+                f"{len(view_labels)} active view(s)"
+                f"{f' from rule ' + str(sys_engine) + f' @ {sys_conf*100:,.0f}% earned confidence' if sys_engine else ''} · "
                 f"{'resampled x' + str(resample_n) if resample_n else 'single fit'}.")
 
             try:
@@ -2822,7 +3176,7 @@ def main():
                                           uni["start_str"], uni["end_str"])
                 caps_map = uni["caps"]; liq_fallback = None
 
-                def _make_builder(with_views):
+                def _make_builder(with_views, engine=None):
                     def _builder(train_returns, cov_annual):
                         # re-derive the prior from data available at this point only
                         w_m, _ = market_weights(usable, caps_map, fallback_weights=liq_fallback)
@@ -2831,7 +3185,24 @@ def main():
                             d = float(delta_manual)
                         else:
                             d, _n = implied_risk_aversion(w_m, cov_annual, float(w_m @ hist) - rf)
-                        if with_views:
+
+                        if engine is not None:
+                            # THE HONEST PATH. Rebuild the views from the rule using
+                            # only prices up to this rebalance, and recalibrate the
+                            # confidence from the rule's hit rate over that same
+                            # window. Nothing from the future enters, so unlike typed
+                            # views this genuinely tests whether views add value.
+                            px_now = prices.loc[:train_returns.index[-1]]
+                            hr_t, nc_t = engine_hit_rate(px_now, engine, freq_per_year,
+                                                         holding_periods=hcfg["rebal"])
+                            c_t, _ = confidence_from_hit_rate(hr_t, nc_t)
+                            Pe, Qe, ce, _lab = systematic_views(
+                                px_now, usable, engine, freq_per_year,
+                                n_pairs=sys_n_pairs, conf=c_t)
+                            out = black_litterman(cov_annual, w_m, rf, tau, d, Pe, Qe, ce,
+                                                  omega_method=omega_method,
+                                                  use_posterior_cov=use_posterior_cov)
+                        elif with_views:
                             out = black_litterman(cov_annual, w_m, rf, tau, d, P, Q, conf,
                                                   omega_method=omega_method,
                                                   use_posterior_cov=use_posterior_cov)
@@ -2859,10 +3230,20 @@ def main():
                                                 else None),
                                vol_lookback=vol_lookback, vol_max_leverage=vol_max_lev)
                 run_views = bool(backtest_uses_views and bl["has_views"])
-                with st.spinner("Back-testing (walk-forward, re-deriving the equilibrium each time)..."):
-                    bt = run_backtest(prices, mu_builder=_make_builder(run_views), **bt_args)
-                    if run_views:
+                if sys_engine is not None:
+                    # Systematic views can be tested honestly, so always run the
+                    # pair: rule-driven vs pure equilibrium. The gap between them
+                    # IS the answer to "do views add value?".
+                    with st.spinner("Back-testing the rule against pure equilibrium "
+                                    "(re-deriving views at every rebalance)..."):
+                        bt = run_backtest(prices, mu_builder=_make_builder(False, engine=sys_engine),
+                                          **bt_args)
                         bt_eq = run_backtest(prices, mu_builder=_make_builder(False), **bt_args)
+                else:
+                    with st.spinner("Back-testing (walk-forward, re-deriving the equilibrium each time)..."):
+                        bt = run_backtest(prices, mu_builder=_make_builder(run_views), **bt_args)
+                        if run_views:
+                            bt_eq = run_backtest(prices, mu_builder=_make_builder(False), **bt_args)
 
             # ---- execution table ----
             execution_date = prices.index[-1]
@@ -3000,6 +3381,8 @@ def main():
                 "frontier": frontier, "mc_vols": mcv, "mc_rets": mcr, "mc_sharpes": mcs,
                 "do_backtest": do_backtest, "bt": bt, "bt_eq": bt_eq,
                 "backtest_uses_views": bool(backtest_uses_views and bl["has_views"]),
+                "sys_engine": sys_engine, "sys_conf": sys_conf,
+                "sys_conf_note": sys_conf_note,
                 "exec_df": exec_df, "detail_cols": detail_cols, "exec_fmt": exec_fmt,
                 "leftover_total": leftover_total, "fx_warn": fx_warn,
                 "capital_warn": capital_warn, "n_unaffordable": n_unaffordable,
