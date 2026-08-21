@@ -28,6 +28,30 @@ You can see this working in the app: the **Markowitz wt %** column sits next to 
 - **Optional posterior covariance** Σ + M, for when you want to acknowledge that the posterior mean is itself uncertain.
 - Correct **excess-return handling** throughout: absolute views are converted as `q − rf`, relative views leave rf to cancel. Getting this wrong is the most common Black-Litterman bug and it silently shifts every view by the risk-free rate.
 
+### Asset-class universes, and why they matter
+
+Alongside the stock universes there are three ETF universes — **Global multi-asset**, **US sectors**, **Global equity regions**. These are not a convenience; they fix the deepest flaw in the stock version.
+
+Black-Litterman's prior only means something if **w is the market portfolio**. A hand-picked slice of 25 large caps is not one, and selecting today's most liquid names then back-testing them imports the answer: in the US stock run, the universe beat its own index by 16.6pp a year purely through survivorship and selection bias. An ETF spanning an asset class has none of that — it existed throughout the test window, and constituent churn is handled inside the fund.
+
+It is also the problem Black and Litterman actually wrote about in 1992: global allocation across markets, not stock selection. And the estimation burden collapses — 13 assets means 91 covariance parameters instead of 325, on inputs whose correlations are far more stable.
+
+### Systematic view engines
+
+Typed views cannot be tested. You form them today, so applying them to past trades is look-ahead bias — which is why a backtest of manual views is meaningless. A **rule** can be rebuilt at every rebalance from data available at that moment, so the backtest finally answers the question that matters: *do views add anything?*
+
+Four engines, each a pure function of price history: **momentum (12-1)**, **short-term reversal**, **trend (price vs 200d)**, **low volatility**.
+
+**Confidence is earned, not typed.** Each engine's realised hit rate is measured by walking forward through the history — form the view using only past prices, check the sign of what actually happened — and converted by
+
+```
+confidence = 2 x (hit rate - 50%)
+```
+
+shrunk for sample size and capped below 100%. A rule that is right half the time carries no information and gets **zero** confidence, so the posterior ignores it entirely. On a random walk, no engine earns meaningful confidence — that is a test, not a claim.
+
+The backtest then runs the rule against pure equilibrium and reports the difference. A universe you did not pick, views you did not guess, confidence you did not choose.
+
 ### Volatility-targeting overlay
 
 Scales exposure to a volatility target, computed from a trailing window of realised portfolio returns. Volatility clusters — a turbulent week follows a turbulent week — while returns don't, so yesterday's volatility forecasts tomorrow's even though yesterday's return doesn't. Capped at 1.0x by default, so it can only ever move into cash, never borrow; the un-invested fraction earns the risk-free rate.
@@ -114,7 +138,7 @@ On Windows, if `streamlit` isn't on your PATH, use `python -m streamlit run blac
 python test_bl_core.py
 ```
 
-67 headless checks covering the numeric core, with Streamlit and yfinance stubbed so nothing needs a server or a network connection. They check reverse optimisation round-trips, that the two posterior formulas agree, Ω construction under both methods, view parsing and excess-return conversion, τ invariance, confidence linearity, the volatility overlay's no-look-ahead property, the negative-Sharpe artifact, the share allocator (never overspends, respects board lots, strands less than one lot), and the relative volatility target (proven free of look-ahead by a divergent-futures test).
+88 headless checks covering the numeric core, with Streamlit and yfinance stubbed so nothing needs a server or a network connection. They check reverse optimisation round-trips, that the two posterior formulas agree, Ω construction under both methods, view parsing and excess-return conversion, τ invariance, confidence linearity, the volatility overlay's no-look-ahead property, the negative-Sharpe artifact, the share allocator (never overspends, respects board lots, strands less than one lot), the relative volatility target, and the systematic view engines — both proven free of look-ahead by divergent-futures tests.
 
 Two properties worth knowing about, both locked down by tests:
 
