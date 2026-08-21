@@ -698,6 +698,73 @@ check("that count clears the observations-per-asset bar for a 25-asset universe"
 
 # =========================================================
 print()
+print("--- Ledoit-Wolf: vectorised form equals the textbook loop ---")
+
+
+def _lw_reference(X):
+    """The literal Ledoit-Wolf (2004) formulation, loop and all. Slow, and kept
+    here purely as the thing the fast version must agree with."""
+    X = np.asarray(X, dtype=float)
+    t, n = X.shape
+    Xc = X - X.mean(axis=0, keepdims=True)
+    S = (Xc.T @ Xc) / t
+    mm = np.trace(S) / n
+    d2 = np.sum((S - mm * np.eye(n)) ** 2) / n
+    b = 0.0
+    for i in range(t):
+        xi = Xc[i][:, None]
+        b += np.sum((xi @ xi.T - S) ** 2)
+    b = b / (t ** 2) / n
+    b2 = min(b, d2)
+    a2 = d2 - b2
+    sh = b2 / d2 if d2 > 0 else 1.0
+    return sh * mm * np.eye(n) + (a2 / d2 if d2 > 0 else 0.0) * S
+
+
+_rng_lw = np.random.default_rng(3)
+_worst = 0.0
+for _T, _n in ((300, 10), (900, 25), (400, 40)):
+    _X = _rng_lw.normal(0, 0.012, size=(_T, _n))
+    _worst = max(_worst, float(np.abs(_lw_reference(_X) - bl.ledoit_wolf_identity(_X)).max()))
+check("vectorised Ledoit-Wolf matches the loop to machine precision",
+      _worst < 1e-15, f"worst |diff| = {_worst:.2e}")
+
+# Shrinkage must still behave. Test it on data with REAL correlation (a single
+# common factor); on pure noise the sample covariance is genuinely near-diagonal,
+# so "less shrinkage" would look like less off-diagonal mass and the test would
+# read backwards.
+def _factor_panel(T, n=25, seed=11):
+    r = np.random.default_rng(seed)
+    f = r.normal(0, 0.010, size=(T, 1))                 # common factor
+    beta = np.linspace(0.6, 1.4, n)[None, :]
+    return f @ beta + r.normal(0, 0.006, size=(T, n))
+
+
+def _shrink_intensity(X):
+    """How far the estimate sits from the sample covariance: 0 = no shrinkage."""
+    Xc = X - X.mean(axis=0, keepdims=True)
+    S = (Xc.T @ Xc) / X.shape[0]
+    est = bl.ledoit_wolf_identity(X)
+    return float(np.abs(est - S).sum() / max(np.abs(S).sum(), 1e-18))
+
+
+_int_short = _shrink_intensity(_factor_panel(60))
+_int_long = _shrink_intensity(_factor_panel(4000))
+check("shrinkage weakens as the sample grows", _int_long < _int_short,
+      f"intensity {_int_short:.4f} (T=60) vs {_int_long:.4f} (T=4000)")
+check("correlation structure survives on a long sample",
+      np.abs(bl.ledoit_wolf_identity(_factor_panel(4000))
+             - np.diag(np.diag(bl.ledoit_wolf_identity(_factor_panel(4000))))).sum() > 0)
+_panel_long = _factor_panel(4000)
+check("the shrunk covariance is symmetric",
+      np.allclose(bl.ledoit_wolf_identity(_panel_long), bl.ledoit_wolf_identity(_panel_long).T))
+check("the shrunk covariance is positive definite",
+      np.all(np.linalg.eigvalsh(bl.ledoit_wolf_identity(_panel_long)) > 0))
+check("shrinkage keeps a rank-deficient panel invertible (T < n)",
+      np.all(np.linalg.eigvalsh(bl.ledoit_wolf_identity(_factor_panel(15, n=25))) > 0))
+
+# =========================================================
+print()
 if FAILURES:
     print(f"{len(FAILURES)} FAILED: " + ", ".join(FAILURES))
     sys.exit(1)
