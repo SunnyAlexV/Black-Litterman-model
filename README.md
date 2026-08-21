@@ -121,17 +121,21 @@ The app is built to tell you when its own output is unreliable:
 
 Nine markets (S&P 500, FTSE 350, HDAX, SBF 120, Nikkei 225, Nifty 500, S&P/TSX, ASX 200, Hang Seng), automatic liquidity screening, Simple and Advanced modes, an interactive Plotly efficient frontier with click-through allocations, a walk-forward out-of-sample backtest that re-derives the equilibrium at every rebalance, FX conversion, board-lot rounding, an executable trade list with CSV export, and run-to-run comparison.
 
-### History windows
+### History windows — all three horizons estimate from the same data
 
-| Horizon | History | Frequency | Observations |
-|---|---|---|---|
-| Weekly — short-term | 5 years | daily | ~1,260 |
-| Monthly — medium-term | 8 years | daily | ~2,016 |
-| Yearly — long-term | 15 years | weekly | ~780 |
+How long you intend to *hold* and how much history you should *estimate from* are different questions, and conflating them was a real flaw in an earlier version: choosing "weekly" quietly cut the estimation window to two years and left the covariance matrix — and therefore π = δΣw — running on fumes. Wanting to trade weekly is a preference; how much data Σ needs is a statistical fact.
 
-Longer windows help the covariance matrix, whose estimation error falls roughly as 1/√T — and since π = δΣw, a better Σ means a better prior, not merely better risk numbers. They help far less with anything mean-like: a sample mean's standard error is driven by volatility rather than sample length, so decades are needed to pin one down, and reaching further back means averaging across regimes that no longer exist. These windows are the compromise.
+So the horizon now sets **only** the return frequency and the rebalance period. Every horizon estimates from the same long window:
 
-A single young ticker no longer truncates the universe. Any name covering less than 90% of the requested window is dropped and reported, rather than silently shortening every other asset's history to match it.
+| Horizon | Estimation window | Frequency | Rebalances | Observations per asset |
+|---|---|---|---|---|
+| Weekly — short-term | up to 15 years | daily | every 5 days | ~150 |
+| Monthly — medium-term | up to 15 years | daily | every 21 days | ~150 |
+| Yearly — long-term | up to 15 years | weekly | every 52 weeks | ~30–60 |
+
+**The window is chosen from the data, not imposed.** Demanding a fixed 15 years would silently discard every asset younger than that — half a Nifty universe in practice — while a naive `dropna()` would truncate *every* asset to the youngest one's history. Instead the app walks the window down from 15 years and stops at the longest length that still supports a full-sized universe and clears an observations-per-asset bar, backfilling any excluded names from the next most liquid long-lived candidates. A universe where nothing is old shortens the window gracefully rather than failing.
+
+Why longer helps where it does: Σ's estimation error falls roughly as 1/√T, and since the prior is built from Σ, a better Σ means a better prior rather than merely better risk numbers. It helps far less with anything mean-like — a sample mean's standard error is driven by volatility, not sample length — which is precisely why Black-Litterman does not estimate expected returns from history in the first place.
 
 ### Per-market recommended settings
 
@@ -156,7 +160,7 @@ On Windows, if `streamlit` isn't on your PATH, use `python -m streamlit run blac
 python test_bl_core.py
 ```
 
-88 headless checks covering the numeric core, with Streamlit and yfinance stubbed so nothing needs a server or a network connection. They check reverse optimisation round-trips, that the two posterior formulas agree, Ω construction under both methods, view parsing and excess-return conversion, τ invariance, confidence linearity, the volatility overlay's no-look-ahead property, the negative-Sharpe artifact, the share allocator (never overspends, respects board lots, strands less than one lot), the relative volatility target, and the systematic view engines — both proven free of look-ahead by divergent-futures tests.
+96 headless checks covering the numeric core, with Streamlit and yfinance stubbed so nothing needs a server or a network connection. They check reverse optimisation round-trips, that the two posterior formulas agree, Ω construction under both methods, view parsing and excess-return conversion, τ invariance, confidence linearity, the volatility overlay's no-look-ahead property, the negative-Sharpe artifact, the share allocator (never overspends, respects board lots, strands less than one lot), the relative volatility target, the systematic view engines — both proven free of look-ahead by divergent-futures tests — and the adaptive history window.
 
 Two properties worth knowing about, both locked down by tests:
 
