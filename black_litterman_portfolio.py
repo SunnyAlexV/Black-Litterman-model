@@ -1569,13 +1569,25 @@ def efficient_frontier(mu, cov, rf, stance, max_weight, gross_limit, n_points=40
 # =========================================================
 # BACKTEST
 # =========================================================
-def perf_metrics(period_returns, freq_per_year, rf):
+def perf_metrics(period_returns, freq_per_year, rf, years=None):
+    """Realised performance. `years` is the actual CALENDAR time the returns span.
+
+    Without it, annualising divides the period count by a nominal 252 trading
+    days. India trades about 247 days a year, so 2,035 observations get treated
+    as 8.075 years when they really span 8.225 -- and every 'per year' figure
+    comes out about 0.25pp too high. That is small, but it is a free
+    overstatement in the app's favour, and 'per year' has to mean a year on the
+    calendar if anyone is going to compare it against a deposit rate.
+    """
     pr = np.asarray(period_returns, dtype=float)
     if len(pr) == 0:
         return None
+    # Periods per year implied by the data itself, falling back to the nominal
+    # figure when the caller cannot supply a span.
+    ppy = (len(pr) / float(years)) if (years and float(years) > 0) else float(freq_per_year)
     growth = np.prod(1.0 + pr)
-    ann_ret = growth ** (freq_per_year / len(pr)) - 1.0 if growth > 0 else -1.0
-    ann_vol = pr.std(ddof=1) * math.sqrt(freq_per_year) if len(pr) > 1 else 0.0
+    ann_ret = growth ** (ppy / len(pr)) - 1.0 if growth > 0 else -1.0
+    ann_vol = pr.std(ddof=1) * math.sqrt(ppy) if len(pr) > 1 else 0.0
     sharpe = (ann_ret - rf) / ann_vol if ann_vol > 0 else np.nan
     eq = np.cumprod(1.0 + pr)
     peak = np.maximum.accumulate(eq)
@@ -1804,12 +1816,18 @@ def run_backtest(prices, freq, use_log, mu_builder, cov_method, freq_per_year, r
         return None
 
     m = len(pnl)
+    # The real elapsed time of the out-of-sample window, from the dates
+    # themselves rather than from a nominal trading-day count.
+    _d = pd.DatetimeIndex(dates)
+    test_years = ((_d[-1] - _d[0]).days / 365.25) if len(_d) > 1 else None
+    if not test_years or test_years <= 0:
+        test_years = m / float(freq_per_year)
     wb = np.repeat(1.0 / n, n)
     pb_native, _ = buy_and_hold_returns(R_simple.iloc[start_i:start_i + m].values, wb)
     pb = to_report(pb_native, start_i, start_i + m)                  # equal-weight, reporting ccy
 
-    strat = perf_metrics(np.array(pnl), freq_per_year, rf)
-    bench = perf_metrics(pb, freq_per_year, rf)
+    strat = perf_metrics(np.array(pnl), freq_per_year, rf, years=test_years)
+    bench = perf_metrics(pb, freq_per_year, rf, years=test_years)
 
     # Buy-and-hold the CAP-WEIGHTED market portfolio of the same names. This is
     # the benchmark that actually matters for Black-Litterman: with no views the
@@ -1822,16 +1840,17 @@ def run_backtest(prices, freq, use_log, mu_builder, cov_method, freq_per_year, r
             pm_native, _ = buy_and_hold_returns(
                 R_simple.iloc[start_i:start_i + m].values, wm)
             market_perf = perf_metrics(to_report(pm_native, start_i, start_i + m),
-                                       freq_per_year, rf)
+                                       freq_per_year, rf, years=test_years)
 
     index_perf = None
     if bench_prices is not None and np.any(idx_ret[start_i:start_i + m] != 0):
         idx_report = to_report(idx_ret[start_i:start_i + m], start_i, start_i + m)
-        index_perf = perf_metrics(idx_report, freq_per_year, rf)
+        index_perf = perf_metrics(idx_report, freq_per_year, rf, years=test_years)
 
     # The same strategy without the volatility overlay — the honest like-for-like
     # comparison that shows whether the overlay earned its keep.
-    unscaled_perf = perf_metrics(np.array(pnl_unscaled), freq_per_year, rf) if do_vt else None
+    unscaled_perf = perf_metrics(np.array(pnl_unscaled), freq_per_year, rf,
+                                 years=test_years) if do_vt else None
 
     return {"strat": strat, "bench": bench, "index": index_perf, "index_label": bench_label,
             "market": market_perf,
@@ -1846,7 +1865,7 @@ def run_backtest(prices, freq, use_log, mu_builder, cov_method, freq_per_year, r
             "scales": np.array(scales) if scales else None,
             "dates": pd.DatetimeIndex(dates), "fx_applied": fx_applied,
             "train_start": R_est.index[0], "split_date": R_est.index[start_i],
-            "n_test": m, "n_train": start_i,
+            "n_test": m, "n_train": start_i, "test_years": float(test_years),
             "n_rebalances": n_rebalances, "rebal_label": rebal_label,
             "avg_turnover": turnover_sum / max(n_rebalances, 1)}
 
@@ -2260,7 +2279,7 @@ def _render_backtest(res, bt, bt_eq=None):
     idx = bt.get("index"); idx_label = bt.get("index_label", "Index")
     mkt = bt.get("market")
     test_start, test_end = bt["dates"][0], bt["dates"][-1]
-    yrs = bt["n_test"] / freq_per_year
+    yrs = bt.get("test_years") or (bt["n_test"] / freq_per_year)
     strat_final = total_capital * float(s["equity"][-1])
     strat_pnl = strat_final - total_capital
     strat_ret_tot = strat_final / total_capital - 1.0 if total_capital else 0.0
@@ -2456,6 +2475,12 @@ def _render_backtest(res, bt, bt_eq=None):
     ax4.plot(bt["dates"], total_capital * b["equity"], label="Equal-weight of same stocks",
              color="#888", lw=1.0, ls=":")
     ax4.axhline(total_capital, color="black", lw=0.6)
+    # Matplotlib's default 5% margin pads roughly five months of empty space
+    # onto each end, so the axis reads 2018-2027 for data that stops in August
+    # 2026 -- and the trailing gap looks like the strategy went flat. Pin the
+    # limits to the actual first and last observation.
+    if len(bt["dates"]) > 1:
+        ax4.set_xlim(bt["dates"][0], bt["dates"][-1])
     ax4.set_ylabel(f"Portfolio value ({bc})")
     ax4.set_title(f"Out-of-sample value of {total_capital:,.0f} {bc} "
                   f"({test_start.date()} → {test_end.date()})")
