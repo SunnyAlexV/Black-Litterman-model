@@ -841,6 +841,69 @@ check("turnover per rebalance grows with the holding period",
 
 # =========================================================
 print()
+print("--- return frequency vs synchronous trading ---")
+
+_n_tz, _T_tz = 12, 3780
+_IDX_TZ = pd.bdate_range("2011-01-03", periods=_T_tz)
+
+
+def _panel_tz(phi, lead, seed=4):
+    """A factor panel with optional AR(1) and optional lead-lag (non-synchronous
+    sessions, as when SPY, EFA and EEM close hours apart)."""
+    rg = np.random.default_rng(seed)
+    f = np.zeros(_T_tz)
+    e = rg.normal(0, 0.009, _T_tz)
+    for t in range(1, _T_tz):
+        f[t] = phi * f[t - 1] + e[t]
+    beta = np.linspace(0.7, 1.3, _n_tz)
+    R = np.outer(f, beta) + rg.normal(0, 0.006, size=(_T_tz, _n_tz))
+    if lead:
+        R[1:, _n_tz // 2:] = ((1 - lead) * R[1:, _n_tz // 2:]
+                              + lead * np.outer(f[:-1], beta[_n_tz // 2:]))
+    return pd.DataFrame(100 * np.cumprod(1 + R, axis=0), index=_IDX_TZ,
+                        columns=[f"A{i}" for i in range(_n_tz)])
+
+
+def _mean_corr(px, freq, fpy):
+    C = bl.estimate_cov(bl.to_returns(px, freq, True), "Ledoit-Wolf shrinkage", fpy).values
+    d = np.sqrt(np.diag(C))
+    R = C / np.outer(d, d)
+    return float(R[np.triu_indices(_n_tz, 1)].mean())
+
+
+_sync = _panel_tz(0.0, 0.0)
+_async = _panel_tz(0.0, 0.35)
+_gap_sync = _mean_corr(_sync, "Weekly", 52) - _mean_corr(_sync, "Daily", 252)
+_gap_async = _mean_corr(_async, "Weekly", 52) - _mean_corr(_async, "Daily", 252)
+
+check("daily and weekly agree when assets trade in the same session",
+      abs(_gap_sync) < 0.03, f"correlation gap {_gap_sync:+.3f}")
+check("daily UNDERSTATES correlation when sessions do not overlap",
+      _gap_async > 0.05, f"correlation gap {_gap_async:+.3f}")
+check("the non-synchronous distortion is much larger than the synchronous one",
+      _gap_async > 3 * abs(_gap_sync), f"{_gap_async:.3f} vs {abs(_gap_sync):.3f}")
+
+# The universes spanning time zones must be flagged so the app measures them weekly.
+_flagged = {k for k, v in bl.MARKETS.items() if v.get("cross_tz")}
+check("global multi-timezone universes are flagged cross_tz",
+      "Global multi-asset (ETFs)" in _flagged and "Global equity regions (ETFs)" in _flagged,
+      str(sorted(_flagged)))
+check("single-exchange universes are NOT flagged",
+      not any(bl.MARKETS[k].get("cross_tz")
+              for k in ("India — Nifty 500", "United States — S&P 500", "US sectors (ETFs)")))
+
+# Rescaling the rebalance period must preserve rebalances-per-year.
+for _lbl, _c in bl.HORIZON_CFG.items():
+    _daily = _c["rebal"]
+    _weekly = max(1, int(round(_daily * 52 / 252)))
+    _per_yr_d = 252 / _daily
+    _per_yr_w = 52 / _weekly
+    check(f"{_lbl.split(' ')[0]}: rebalance rate survives a switch to weekly returns",
+          abs(_per_yr_d - _per_yr_w) / _per_yr_d < 0.10,
+          f"{_per_yr_d:.1f}/yr daily vs {_per_yr_w:.1f}/yr weekly")
+
+# =========================================================
+print()
 if FAILURES:
     print(f"{len(FAILURES)} FAILED: " + ", ".join(FAILURES))
     sys.exit(1)
