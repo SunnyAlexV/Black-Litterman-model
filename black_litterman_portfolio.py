@@ -153,144 +153,22 @@ BENCHMARKS = {
 }
 
 # Per-market recommended defaults, applied automatically when the market is
-# chosen. rf is the local short-dated government yield (the opportunity cost the
-# equilibrium is measured against) and tc is a realistic all-in round-trip
-# trading cost for liquid large caps in that market. Both are set once here so
-# nobody has to remember that India charges STT and the US does not.
+# chosen. rf is the local short-dated government yield -- the opportunity cost
+# the equilibrium prior is measured against.
 #   rf sources: 1-year government bill yields, August 2026.
 MARKET_DEFAULTS = {
-    "United States — S&P 500":         {"rf": 0.041, "tc_bps": 10.0},
-    "United Kingdom — FTSE 350":       {"rf": 0.040, "tc_bps": 20.0},   # incl. 0.5% stamp on buys
-    "Germany — HDAX":                  {"rf": 0.023, "tc_bps": 12.0},
-    "France — SBF 120":                {"rf": 0.024, "tc_bps": 15.0},   # incl. FTT on large caps
-    "Japan — Nikkei 225":              {"rf": 0.008, "tc_bps": 12.0},
-    "India — Nifty 500":               {"rf": 0.060, "tc_bps": 25.0},   # incl. STT, stamp, exchange
-    "Canada — S&P/TSX Composite":      {"rf": 0.031, "tc_bps": 12.0},
-    "Australia — S&P/ASX 200":         {"rf": 0.037, "tc_bps": 15.0},
-    "Hong Kong — Hang Seng Composite": {"rf": 0.035, "tc_bps": 22.0},   # incl. stamp duty
+    "United States — S&P 500":         {"rf": 0.041},
+    "United Kingdom — FTSE 350":       {"rf": 0.040},
+    "Germany — HDAX":                  {"rf": 0.023},
+    "France — SBF 120":                {"rf": 0.024},
+    "Japan — Nikkei 225":              {"rf": 0.008},
+    "India — Nifty 500":               {"rf": 0.060},
+    "Canada — S&P/TSX Composite":      {"rf": 0.031},
+    "Australia — S&P/ASX 200":         {"rf": 0.037},
+    "Hong Kong — Hang Seng Composite": {"rf": 0.035},
 }
 DEFAULT_RF = 0.04
-DEFAULT_TC_BPS = 15.0
 
-# =========================================================
-# WHAT A TRADE ACTUALLY COSTS
-# =========================================================
-# A flat basis-point charge is a fiction that flatters small accounts. Real
-# retail costs have a FIXED component -- India's depository (DP) charge is
-# about Rs 16 every time you sell a scrip, whatever the size -- and a fixed
-# charge does not scale. On a Rs 200,000 sale it is 0.8 bps and irrelevant. On
-# a Rs 200 sale it is 800 bps, thirty times the flat 25 bps this app used to
-# assume, and it is the single biggest reason a small account should hold
-# fewer names and trade less often than a large one.
-#
-# Percentages are of trade value. `dp_flat_sell` is in the market's own
-# currency and charged per SELL order per scrip. `min_brokerage` floors the
-# brokerage on tiny orders, which is the other fixed charge that bites.
-#   Sources: SEBI/NSE/CDSL published rates and broker tariff sheets, 2026.
-#   These change; every field is editable in Advanced.
-BROKER_PRESETS = {
-    "India — discount broker, delivery (Zerodha, Groww, Upstox)": {
-        "currency": "INR",
-        "brokerage_pct": 0.0,        # equity delivery is free at discount brokers
-        "min_brokerage": 0.0,
-        "brokerage_cap": 20.0,
-        "stt_buy_pct": 0.001,        # 0.1% delivery, both sides
-        "stt_sell_pct": 0.001,
-        "stamp_buy_pct": 0.00015,    # 0.015%, buy side only
-        "exch_pct": 0.0000297,       # NSE cash
-        "sebi_pct": 0.000001,
-        "gst_pct": 0.18,             # on brokerage + exchange + SEBI
-        "dp_flat_sell": 15.93,       # CDSL/NSDL + broker, per scrip per sell day
-        "slippage_pct": 0.0005,      # half-spread on a liquid large cap
-    },
-    "India — full-service broker, delivery": {
-        "currency": "INR",
-        "brokerage_pct": 0.003,      # 0.30% per side is typical
-        "min_brokerage": 25.0,
-        "brokerage_cap": None,
-        "stt_buy_pct": 0.001, "stt_sell_pct": 0.001,
-        "stamp_buy_pct": 0.00015,
-        "exch_pct": 0.0000297, "sebi_pct": 0.000001, "gst_pct": 0.18,
-        "dp_flat_sell": 20.0,
-        "slippage_pct": 0.0005,
-    },
-    "United States — commission-free broker": {
-        "currency": "USD",
-        "brokerage_pct": 0.0, "min_brokerage": 0.0, "brokerage_cap": None,
-        "stt_buy_pct": 0.0, "stt_sell_pct": 0.0000278,   # SEC fee, sells only
-        "stamp_buy_pct": 0.0,
-        "exch_pct": 0.0, "sebi_pct": 0.0, "gst_pct": 0.0,
-        "dp_flat_sell": 0.0,
-        "slippage_pct": 0.0003,
-    },
-    "Flat basis points (simple, size-blind)": None,   # falls back to tc_bps
-}
-DEFAULT_BROKER_BY_MARKET = {
-    "India — Nifty 500": "India — discount broker, delivery (Zerodha, Groww, Upstox)",
-    "United States — S&P 500": "United States — commission-free broker",
-}
-
-
-def order_cost(value, side, cfg):
-    """Cost of ONE order of `value` currency units, in currency units.
-
-    `side` is 'BUY' or 'SELL'. Returns 0 for a zero-value order so that a
-    position left untouched is never charged.
-    """
-    v = abs(float(value))
-    if v <= 0 or not cfg:
-        return 0.0
-    buy = str(side).upper().startswith("B")
-
-    pct = float(cfg.get("brokerage_pct", 0.0) or 0.0)
-    brok = v * pct
-    cap = cfg.get("brokerage_cap")
-    if cap is not None:
-        brok = min(brok, float(cap))
-    floor = float(cfg.get("min_brokerage", 0.0) or 0.0)
-    if pct > 0 and floor > 0:            # a floor only applies where there IS brokerage
-        brok = max(brok, floor)
-
-    stt = v * float(cfg.get("stt_buy_pct" if buy else "stt_sell_pct", 0.0) or 0.0)
-    stamp = v * float(cfg.get("stamp_buy_pct", 0.0) or 0.0) if buy else 0.0
-    exch = v * float(cfg.get("exch_pct", 0.0) or 0.0)
-    sebi = v * float(cfg.get("sebi_pct", 0.0) or 0.0)
-    gst = float(cfg.get("gst_pct", 0.0) or 0.0) * (brok + exch + sebi)
-    dp = 0.0 if buy else float(cfg.get("dp_flat_sell", 0.0) or 0.0)
-    slip = v * float(cfg.get("slippage_pct", 0.0) or 0.0)
-    return brok + stt + stamp + exch + sebi + gst + dp + slip
-
-
-def roundtrip_bps(value, cfg):
-    """All-in cost of buying then selling `value`, in basis points of value.
-
-    This is the number to compare against a flat tc_bps assumption, and the
-    number that explodes as `value` shrinks.
-    """
-    v = abs(float(value))
-    if v <= 0:
-        return float("inf")
-    return (order_cost(v, "BUY", cfg) + order_cost(v, "SELL", cfg)) / v * 1e4
-
-
-def trade_book_cost(dw, port_value, cfg, fallback_bps=None):
-    """Total cost of moving a book by weight-deltas `dw`, as a FRACTION of value.
-
-    Every non-zero weight change becomes its own order, which is what makes the
-    fixed charges bite: rebalancing 25 names by a hair is 25 orders, not one.
-    """
-    dw = np.asarray(dw, dtype=float)
-    if cfg is None:
-        bps = float(fallback_bps if fallback_bps is not None else 0.0)
-        return (bps / 1e4) * float(np.sum(np.abs(dw)))
-    pv = float(port_value)
-    if pv <= 0:
-        return 0.0
-    total = 0.0
-    for d in dw:
-        if abs(d) > 1e-12:
-            total += order_cost(abs(d) * pv, "BUY" if d > 0 else "SELL", cfg)
-    return total / pv
 
 # Recommended defaults for the settings that actually change the answer.
 DEFAULT_MAX_WEIGHT_PCT = 12     # single-STOCK cap; keeps ~8+ real positions
@@ -303,8 +181,7 @@ DEFAULT_VOL_TARGET_FRAC_PCT = 75     # relative-mode default: run at 75% of the 
 
 
 def market_default(market_name, key):
-    return MARKET_DEFAULTS.get(market_name, {}).get(
-        key, DEFAULT_RF if key == "rf" else DEFAULT_TC_BPS)
+    return MARKET_DEFAULTS.get(market_name, {}).get(key, DEFAULT_RF)
 
 
 def affordable_holdings(last_prices, capital, target_n, min_n=5, lots_per_name=3.0):
@@ -1495,127 +1372,6 @@ def black_litterman(Sigma, w_mkt, rf, tau, delta, P, Q, conf,
 # =========================================================
 # OPTIMIZATION
 # =========================================================
-def project_to_bounds(w, lb, ub, net, iters=300):
-    """Nearest-ish point of {sum(w) = net, lb <= w <= ub}: clip, redistribute, repeat.
-
-    A book that has merely drifted is still a book you own, so when asking
-    'how far can it drift before trading pays?' the drifted book has to be
-    one the constraints would actually permit. Skip this and every test case
-    where drift pushed a holding past the position cap becomes a FORCED trade,
-    which then gets miscounted as evidence that trading was worthwhile.
-    """
-    w = np.clip(np.asarray(w, dtype=float), lb, ub)
-    for _ in range(iters):
-        s = float(w.sum())
-        if abs(s - net) < 1e-12:
-            break
-        room = (w < ub - 1e-12) if s < net else (w > lb + 1e-12)
-        if not room.any():
-            break
-        tot = float(np.abs(w[room]).sum())
-        if tot > 1e-12:
-            w[room] = w[room] + (net - s) * np.abs(w[room]) / tot
-        else:
-            w[room] = w[room] + (net - s) / int(room.sum())
-        w = np.clip(w, lb, ub)
-    return w
-
-
-def breakeven_drift(w_star, solve_fn, lb, ub, net, seed=7, n_paths=3,
-                    scales=None, min_trade=2e-3):
-    """How far a book must drift before the cost-aware optimiser will trade it.
-
-    This ASKS THE SOLVER rather than modelling it. An earlier version compared
-    the certainty-equivalent gain of correcting one position against the
-    commission for doing so, which is tidy and wrong: it says no trade ever
-    clears the cost on a US monthly schedule, while the solver on the same
-    inputs trades in 68 of 625 position-level decisions. The error is that a
-    correction spread across many names gains far more, for the same L1
-    turnover, than the same movement concentrated in one -- so a single-name
-    formula overstates the band, sometimes by an order of magnitude.
-
-    So: drift the optimal book by progressively larger amounts, project it back
-    inside the constraints so nothing is a forced trade, and report the drift at
-    which the solver first chooses to act. `min_trade` is the turnover below
-    which the answer counts as 'did nothing'. Returns the typical (median)
-    per-position deviation at that point, or inf if the solver never trades.
-    """
-    w_star = np.asarray(w_star, dtype=float)
-    n = len(w_star)
-    if n == 0:
-        return float("inf")
-    if scales is None:
-        scales = (0.04, 0.08, 0.15, 0.25, 0.40, 0.60, 0.90)
-    rng = np.random.default_rng(seed)
-    big = np.abs(w_star) > 0.01          # drift in a 0.2% holding is not a decision
-
-    for s in scales:
-        devs = []
-        for p in range(n_paths):
-            w_prev = project_to_bounds(w_star * np.exp(rng.normal(0, s, n)), lb, ub, net)
-            try:
-                w_new = solve_fn(w_prev)
-            except Exception:
-                continue
-            if float(np.sum(np.abs(np.asarray(w_new) - w_prev))) > min_trade:
-                d = np.abs(w_prev - w_star)
-                devs.append(float(np.median(d[big])) if big.any() else float(np.median(d)))
-        if devs:
-            return float(np.median(devs))
-    return float("inf")
-
-
-def rebalance_guidance(tc_bps, rebals_per_year, breakeven, max_weight_pct,
-                       observed_turnover=None):
-    """Turn the break-even band into something a person can act on.
-
-    Returns (headline, detail, severity) where severity is one of
-    'none' / 'rare' / 'normal'.
-    """
-    tc_frac = float(tc_bps) / 1e4
-    per_unit = tc_frac * float(rebals_per_year)          # annual charge per unit traded
-    cap = float(max_weight_pct) / 100.0 if max_weight_pct else 1.0
-    times = "once" if abs(rebals_per_year - 1) < 1e-9 else f"{rebals_per_year:,.0f} times"
-    reb_phrase = ("once a year" if abs(rebals_per_year - 1) < 1e-9
-                  else f"{rebals_per_year:,.0f} times a year")
-    bill = ""
-    if observed_turnover is not None and np.isfinite(observed_turnover):
-        bill = (f" The backtest turned over {observed_turnover*100:,.1f}% of the book per "
-                f"rebalance, or **{per_unit*observed_turnover*100:,.2f}pp a year** in "
-                f"commission.")
-    # Only the do-nothing branch may claim the bill is small BECAUSE trades were
-    # declined. In the reachable branch trades are being made, so the same
-    # sentence would be false.
-    refused = (bill + " It is that low precisely because trades like these were already refused."
-               if bill else "")
-
-    longer = ("" if abs(rebals_per_year - 1) < 1e-9 else
-              f" Otherwise, consider a longer horizon — the yearly setting pays this charge "
-              f"once instead of {times}.")
-    if not np.isfinite(breakeven) or breakeven >= cap:
-        return ("At this cost and this frequency, the usual right action is **none**.",
-                f"Trading at {tc_bps:,.0f} bps, {reb_phrase}, charges "
-                f"**{per_unit*100:,.2f}% a year for every 100% of the book you turn over**. "
-                f"No drift a position could realistically develop repays the cost of correcting "
-                f"it — the break-even move is larger than your {max_weight_pct:,.0f}% position "
-                f"limit, so it cannot happen.{refused} The trades that remain worth making are "
-                f"the forced ones: a holding that has drifted past that {max_weight_pct:,.0f}% "
-                f"limit is out of compliance with your own constraint and should come back "
-                f"regardless of cost.{longer}",
-                "none")
-    if breakeven >= 0.015:
-        return (f"Only act when a position has drifted more than **{breakeven*100:,.1f}pp** "
-                f"from its target.",
-                f"Below that the correction costs more than it gains, because the benefit of "
-                f"being closer to target grows with the *square* of the gap while the commission "
-                f"grows in proportion to it, so small adjustments never repay themselves.{bill}",
-                "rare")
-    return (f"Act on drifts beyond about **{breakeven*100:,.1f}pp**; ignore smaller ones.",
-            f"At {tc_bps:,.0f} bps, rebalancing {reb_phrase}, the cost is low enough that even "
-            f"modest corrections pay for themselves.{bill}",
-            "normal")
-
-
 def portfolio_stats(w, mu, cov, rf):
     w = np.asarray(w, dtype=float)
     ret = float(w @ mu)
@@ -1645,30 +1401,6 @@ def _stance_bounds(stance, cap, n):
     if stance == "Short only":
         return -cap, 0.0, -1.0
     return -cap, cap, 1.0  # long-short
-
-
-# Trading is not free, and until now the optimiser was allowed to believe it
-# was: it chose weights in a vacuum and the backtest charged the bill
-# afterwards. So it would happily propose a trade whose expected benefit was
-# smaller than its own commission.
-#
-# The cost is c * sum|w - w_prev|, which is not differentiable exactly where a
-# weight does not move -- the point every no-trade solution sits on, and the
-# point where SLSQP needs a gradient. The fix is the standard one: split each
-# trade into a buy leg and a sell leg,
-#
-#     w - w_prev - b + s = 0,   b >= 0,  s >= 0,   turnover = sum(b + s)
-#
-# which is exactly linear and perfectly smooth. It costs 2n extra variables.
-# I expected that to be the slow option and measured it instead of guessing:
-# on a 25-asset book it runs at 0.018s per solve against 0.42-1.5s for a
-# smoothed |x| approximation, because conditioning matters far more here than
-# dimension does -- smoothing |x| puts curvature of order 1/eps right where the
-# solution lives and destroys SLSQP's Hessian approximation. The exact
-# formulation is both faster and exact, so there is no trade-off to make.
-def _turnover_split_bounds(lb, ub, n):
-    span = float(ub - lb)
-    return [(lb, ub)] * n + [(0.0, span)] * (2 * n)
 
 
 def _solve(obj_fun, n, lb, ub, net, gross, seed_w=None, extra_starts=None):
@@ -1706,136 +1438,24 @@ def _solve(obj_fun, n, lb, ub, net, gross, seed_w=None, extra_starts=None):
     return best[1]
 
 
-def _solve_with_turnover(obj_fun2, n, lb, ub, net, gross, w_prev, turnover_cost,
-                         w_free, seed_w=None, n_line=201):
-    """As _solve, but the objective is charged for trading away from w_prev.
-
-    `obj_fun2(w, drag)` returns the value to MINIMISE, where `drag` is the
-    annualised return given up executing the trade.
-
-    Everything here is scored by `score()` below, which recomputes the true L1
-    turnover from the weights alone. That matters: inside the solve, turnover
-    is carried by the auxiliary buy/sell variables tied to the weights by an
-    equality constraint, and SLSQP only satisfies equalities to tolerance. The
-    objective rewards a small b + s, so any slack in that constraint is a
-    licence to price a trade below what it really costs -- and, measured, the
-    solver takes it. Ranking candidates on b + s therefore selects for
-    constraint violation. Ranking them on |w - w_prev| cannot.
-
-    Two candidates are supplied before the solver runs, so its answer can only
-    ever improve on them: holding still, and the unpenalised optimum, plus the
-    best partial rebalance on the line between the two. That line search is
-    almost free (one vectorised sweep) and, on its own, already captures most
-    of the available gain.
-    """
-    w_prev = np.asarray(w_prev, dtype=float)
-    tc = float(turnover_cost)
-
-    def score(w):
-        w = np.asarray(w, dtype=float)
-        return obj_fun2(w, tc * float(np.sum(np.abs(w - w_prev))))
-
-    def feasible(w):
-        w = np.asarray(w, dtype=float)
-        if w.shape != (n,) or not np.all(np.isfinite(w)):
-            return False
-        if w.min() < lb - 1e-7 or w.max() > ub + 1e-7:
-            return False
-        if abs(w.sum() - net) > 1e-6:
-            return False
-        if gross is not None and np.sum(np.abs(w)) > gross + 1e-6:
-            return False
-        return True
-
-    cands = [w_prev]
-    if w_free is not None:
-        w_free = np.asarray(w_free, dtype=float)
-        cands.append(w_free)
-        # Partial rebalance: every point on the segment satisfies the budget
-        # and the cap whenever both endpoints do, so no candidate here can be
-        # infeasible.
-        a = np.linspace(0.0, 1.0, n_line)[:, None]
-        for row in (w_prev[None, :] + a * (w_free - w_prev)[None, :]):
-            cands.append(row)
-
-    def packed(x):
-        return obj_fun2(x[:n], tc * float(np.sum(x[n:])))
-
-    cons = [
-        {"type": "eq", "fun": lambda x: np.sum(x[:n]) - net},
-        {"type": "eq", "fun": lambda x, p=w_prev: x[:n] - p - x[n:2 * n] + x[2 * n:]},
-    ]
-    if gross is not None:
-        cons.append({"type": "ineq", "fun": lambda x, g=gross: g - np.sum(np.abs(x[:n]))})
-    bounds = _turnover_split_bounds(lb, ub, n)
-
-    def pack(w):
-        w = np.clip(np.asarray(w, dtype=float), lb, ub)
-        d = w - w_prev
-        return np.concatenate([w, np.clip(d, 0, None), np.clip(-d, 0, None)])
-
-    starts = [pack(w_prev)]
-    if w_free is not None:
-        starts.append(pack(w_free))
-    if seed_w is not None:
-        starts.append(pack(seed_w))
-    for x0 in starts:
-        try:
-            res = minimize(packed, x0, method="SLSQP", bounds=bounds,
-                           constraints=cons, options={"maxiter": 1000, "ftol": 1e-10})
-        except Exception:
-            continue
-        if res.x is not None:
-            cands.append(np.asarray(res.x[:n], dtype=float))
-
-    best_w, best_v = None, None
-    for w in cands:
-        if not feasible(w):
-            continue
-        v = score(w)
-        if np.isfinite(v) and (best_v is None or v < best_v):
-            best_w, best_v = np.asarray(w, dtype=float).copy(), v
-    if best_w is None:
-        raise ValueError("Optimisation failed to converge with the chosen constraints.")
-    return best_w
-
-
 def _optimize_once(objective, mu, cov, R, rf, stance, cap, gross, alpha, freq_per_year,
-                   w_prev=None, turnover_cost=0.0, delta=None):
-    """Solve for optimal weights, optionally net of the cost of trading there.
-
-    With `w_prev` supplied and `turnover_cost` positive, each objective is
-    evaluated AFTER the execution cost of moving from w_prev to w. The four
-    objectives do not share units, so the cost enters each differently:
-
-      Max Sharpe / Max Sortino -- the drag is an annual return, so it comes off
-          the numerator. The result is exactly the after-cost ratio.
-      Min CVaR -- CVaR is a per-period loss already in return units, so add
-          that period's share of the drag.
-      Min variance -- carries no return term at all, so convert through delta,
-          the model's own return-per-unit-variance exchange rate. Maximising
-          w'mu - (delta/2)w'Sw net of cost gives the same ordering as
-          minimising w'Sw + (2/delta) * cost.
-    """
+                   delta=None):
+    """Solve for the optimal weights under the chosen objective and constraints."""
     mu = np.asarray(mu, dtype=float)
     cov = np.asarray(cov, dtype=float)
     n = len(mu)
     lb, ub, net = _stance_bounds(stance, cap, n)
     target_period = rf / freq_per_year
 
-    # One objective, written once, taking the trading drag as an argument so
-    # the penalised and unpenalised paths cannot drift apart.
     if objective == "Min variance":
-        scale = 2.0 / max(float(delta) if delta else 3.0, 1e-6)
-        obj2 = lambda w, drag: float(w @ cov @ w) + scale * drag
+        obj = lambda w: float(w @ cov @ w)
     elif objective == "Max Sortino":
-        obj2 = lambda w, drag: -((w @ mu) - drag - rf) / max(
+        obj = lambda w: -((w @ mu) - rf) / max(
             _downside_dev(w, R, target_period, freq_per_year), 1e-9)
     elif objective == "Min CVaR":
-        _per = 1.0 / max(float(freq_per_year), 1e-9)
-        obj2 = lambda w, drag: _cvar(w, R, alpha) + _per * drag
+        obj = lambda w: _cvar(w, R, alpha)
     else:  # Max Sharpe
-        obj2 = lambda w, drag: -((w @ mu) - drag - rf) / math.sqrt(max(w @ cov @ w, 1e-16))
+        obj = lambda w: -((w @ mu) - rf) / math.sqrt(max(w @ cov @ w, 1e-16))
 
     seed = None
     if objective in ("Max Sharpe", "Min variance"):
@@ -1847,18 +1467,11 @@ def _optimize_once(objective, mu, cov, R, rf, stance, cap, gross, alpha, freq_pe
         except Exception:
             seed = None
 
-    w_free = _solve(lambda w: obj2(w, 0.0), n, lb, ub, net, gross, seed_w=seed)
-    if w_prev is not None and turnover_cost and turnover_cost > 0:
-        # The cost-blind optimum is both the natural warm start and the far end
-        # of the partial-rebalance line, so it is computed either way.
-        return _solve_with_turnover(obj2, n, lb, ub, net, gross, w_prev,
-                                    turnover_cost, w_free, seed_w=seed)
-    return w_free
+    return _solve(obj, n, lb, ub, net, gross, seed_w=seed)
 
 
 def resample_stack(objective, mu, cov, rf, stance, max_weight, gross_limit,
-                   alpha, freq_per_year, resample_n, seed=7,
-                   w_prev=None, turnover_cost=0.0, delta=None):
+                   alpha, freq_per_year, resample_n, seed=7, delta=None):
     """Michaud resampling: return an array (n_draws x n_assets) of optimal weights
     from simulated histories. Its mean is the robust portfolio; its column std
     measures how stable each weight is."""
@@ -1874,9 +1487,7 @@ def resample_stack(objective, mu, cov, rf, stance, max_weight, gross_limit,
         cov_hat = nearest_psd(np.cov(sim, rowvar=False) * freq_per_year)
         try:
             acc.append(_optimize_once(objective, mu_hat, cov_hat, sim, rf, stance,
-                                      cap, gross_limit, alpha, freq_per_year,
-                                      w_prev=w_prev, turnover_cost=turnover_cost,
-                                      delta=delta))
+                                      cap, gross_limit, alpha, freq_per_year, delta=delta))
         except Exception:
             continue
     if not acc:
@@ -1885,17 +1496,14 @@ def resample_stack(objective, mu, cov, rf, stance, max_weight, gross_limit,
 
 
 def optimize_portfolio(objective, mu, cov, R, rf, stance, max_weight, gross_limit,
-                       alpha, freq_per_year, resample_n=0, seed=7,
-                       w_prev=None, turnover_cost=0.0, delta=None):
+                       alpha, freq_per_year, resample_n=0, seed=7, delta=None):
     cap = max_weight if max_weight is not None else 1.0
     if resample_n and resample_n > 0:
         return resample_stack(objective, mu, cov, rf, stance, max_weight, gross_limit,
                               alpha, freq_per_year, resample_n, seed,
-                              w_prev=w_prev, turnover_cost=turnover_cost,
                               delta=delta).mean(axis=0)
     return _optimize_once(objective, mu, cov, R, rf, stance, cap, gross_limit, alpha,
-                          freq_per_year, w_prev=w_prev, turnover_cost=turnover_cost,
-                          delta=delta)
+                          freq_per_year, delta=delta)
 
 
 def _min_var_at_target(mu, cov, lb, ub, net, gross, target):
@@ -2051,14 +1659,12 @@ def buy_and_hold_returns(R, w):
 
 def run_backtest(prices, freq, use_log, mu_builder, cov_method, freq_per_year, rf,
                  stance, max_weight, gross_limit, objective, alpha,
-                 tc_bps, borrow_bps, train_frac, resample_n,
+                 train_frac, resample_n,
                  rebalance_periods=21, rebal_label="periodic",
                  bench_prices=None, fx_prices=None, bench_label="Index",
                  caps_weights=None,
                  vol_target=None, vol_lookback=None, vol_max_leverage=1.0,
-                 vol_target_frac=None,
-                 turnover_lambda=1.0, delta=None,
-                 cost_cfg=None, capital=None, vol_band=0.0):
+                 vol_target_frac=None, delta=None, capital=None):
     """Walk-forward backtest: starting after an initial training window, re-build
     the expected returns every `rebalance_periods` periods using all data up to
     that point (expanding window) and hold those weights until the next
@@ -2098,30 +1704,7 @@ def run_backtest(prices, freq, use_log, mu_builder, cov_method, freq_per_year, r
     pnl, dates = [], []
     n_rebalances = 0
     turnover_sum = 0.0
-    borrow_frac = borrow_bps / 1e4
-    tc_frac = tc_bps / 1e4
-
-    # Cost the optimiser is told about, per unit of gross weight traded,
-    # annualised so it is commensurate with mu. lambda = 1 means "charge the
-    # true expected cost"; above 1 deliberately over-charges, which is the
-    # usual defence against mu being noisier than it looks.
-    rebals_per_year = float(freq_per_year) / max(rebalance_periods, 1)
-    # With a real cost model the charge per unit traded depends on the SIZE of
-    # each order, so the optimiser's flat rate is set from the typical order
-    # this book will actually place: capital spread over n names, moved by a
-    # typical fraction. That is far closer than a market-wide 25 bps, and it is
-    # what makes the optimiser decline the tiny trades that fixed charges make
-    # ruinous.
-    if cost_cfg is not None and capital and capital > 0:
-        typical_order = float(capital) / max(n, 1) * 0.25
-        eff_bps = roundtrip_bps(max(typical_order, 1e-6), cost_cfg) / 2.0
-        opt_tc_frac = eff_bps / 1e4
-    else:
-        opt_tc_frac = tc_frac
-    opt_turnover_cost = opt_tc_frac * rebals_per_year * float(turnover_lambda or 0.0)
     port_value = float(capital) if (capital and capital > 0) else 1.0
-    cost_paid_total = 0.0          # in currency units, for honest reporting
-    n_orders_total = 0
 
     # Volatility targeting state. `hist` accumulates the fully-invested (k=1)
     # portfolio return of each period as it happens, so the scale applied at
@@ -2154,17 +1737,10 @@ def run_backtest(prices, freq, use_log, mu_builder, cov_method, freq_per_year, r
         try:
             cov_tr = estimate_cov(tr, cov_method, freq_per_year)
             mu_tr, sigma_tr = mu_builder(tr, cov_tr.values)
-            # From the second rebalance on, the optimiser is charged for the
-            # trade it is proposing. The first one is exempt: coming from cash,
-            # a long-only book summing to 1 has gross traded == 1 whatever the
-            # weights, so the penalty is a constant that cannot change the
-            # argmin -- and in long-short it would penalise the unavoidable
-            # act of getting invested at all.
             w = optimize_portfolio(objective, np.asarray(mu_tr, dtype=float), sigma_tr,
                                    tr.values, rf, stance, max_weight, gross_limit,
                                    alpha, freq_per_year, resample_n=resample_n,
-                                   w_prev=(prev_w if n_rebalances > 0 else None),
-                                   turnover_cost=opt_turnover_cost, delta=delta)
+                                   delta=delta)
         except Exception:
             w = prev_w if n_rebalances > 0 else np.repeat(1.0 / n, n)
 
@@ -2178,17 +1754,6 @@ def run_backtest(prices, freq, use_log, mu_builder, cov_method, freq_per_year, r
         # rebalance trades away from.
         seg, w_drift = buy_and_hold_returns(R_simple.iloc[i:end_j].values, w)
         seg = seg.astype(float)
-        seg -= borrow_frac * float(np.sum(np.clip(-w, 0, None))) / freq_per_year
-        if len(seg):
-            # Charge every changed position as its OWN order. Rebalancing 25
-            # names by a hair is 25 orders, and under a fixed per-order charge
-            # that is 25 fixed charges -- which is precisely the cost a flat
-            # basis-point rate pretends does not exist.
-            dw = w - prev_w
-            cost_frac = trade_book_cost(dw, port_value, cost_cfg, fallback_bps=tc_bps)
-            seg[0] -= cost_frac
-            cost_paid_total += cost_frac * port_value
-            n_orders_total += int(np.sum(np.abs(dw) > 1e-12))
         seg_report = to_report(seg, i, end_j)                       # -> reporting ccy
 
         if do_vt:
@@ -2216,26 +1781,10 @@ def run_backtest(prices, freq, use_log, mu_builder, cov_method, freq_per_year, r
                 hist_unscaled.extend(np.asarray(warm, dtype=float).tolist())
             scaled = np.empty_like(seg_report)
             for t, r_t in enumerate(seg_report):
-                k_want = vol_target_scale(hist_unscaled, target_now, freq_per_year,
-                                          vol_lookback, vol_max_leverage)
-                # A no-trade band on the overlay. Without one it re-sizes every
-                # position every single day, and under a fixed per-order charge
-                # that is n orders a day forever -- the overlay would cost more
-                # than the portfolio earns. Real implementations use a band;
-                # pretending otherwise makes the overlay look free.
-                k = k_want if abs(k_want - prev_k) > float(vol_band) else prev_k
-                # Changing exposure means trimming or topping every position,
-                # so it is n orders, not one.
-                if abs(k - prev_k) > 1e-12:
-                    dlev = w * (k - prev_k)
-                    lev_cost = trade_book_cost(dlev, port_value, cost_cfg,
-                                               fallback_bps=tc_bps)
-                    cost_paid_total += lev_cost * port_value
-                    n_orders_total += int(np.sum(np.abs(dlev) > 1e-12))
-                else:
-                    lev_cost = 0.0
+                k = vol_target_scale(hist_unscaled, target_now, freq_per_year,
+                                     vol_lookback, vol_max_leverage)
                 # the un-invested fraction earns the risk-free rate
-                scaled[t] = k * r_t + (1.0 - k) * rf_period - lev_cost
+                scaled[t] = k * r_t + (1.0 - k) * rf_period
                 scales.append(k)
                 prev_k = k
                 port_value *= (1.0 + float(scaled[t]))
@@ -2299,16 +1848,6 @@ def run_backtest(prices, freq, use_log, mu_builder, cov_method, freq_per_year, r
             "train_start": R_est.index[0], "split_date": R_est.index[start_i],
             "n_test": m, "n_train": start_i,
             "n_rebalances": n_rebalances, "rebal_label": rebal_label,
-            "turnover_lambda": float(turnover_lambda or 0.0),
-            "turnover_cost_used": opt_turnover_cost,
-            "tc_drag_per_year": opt_tc_frac * (turnover_sum / max(len(pnl), 1)) * freq_per_year,
-            "cost_model": ("real" if cost_cfg is not None else "flat"),
-            "cost_paid_total": float(cost_paid_total),
-            "cost_paid_pct_start": (float(cost_paid_total) / float(capital)
-                                    if (capital and capital > 0) else np.nan),
-            "n_orders": int(n_orders_total),
-            "eff_bps_per_side": (opt_tc_frac * 1e4) if cost_cfg is not None else float(tc_bps),
-            "vol_band": float(vol_band),
             "avg_turnover": turnover_sum / max(n_rebalances, 1)}
 
 # =========================================================
@@ -2740,23 +2279,14 @@ def _render_backtest(res, bt, bt_eq=None):
         f"(up to {bt['split_date'].date()}), the equilibrium prior was re-derived and the portfolio "
         f"re-optimised **{reb}** using only data available at each point, held until the next "
         f"rebalance: {n_reb} rebalances across {bt['n_test']} out-of-sample periods (~{yrs:.1f} yrs), "
-        f"{test_start.date()} to {test_end.date()}. Trading costs charged on turnover "
-        f"(avg {turn*100:,.0f}% per rebalance, ≈{bt.get('tc_drag_per_year', 0)*100:,.2f}pp a year); "
-        f"borrow costs included.{fx_note}")
+        f"{test_start.date()} to {test_end.date()}. Turnover averaged "
+        f"{turn*100:,.0f}% of the book per rebalance.{fx_note}")
 
-    _tl = bt.get("turnover_lambda", 0.0)
-    if _tl > 0:
-        st.caption(
-            f"**The optimiser was charged for its own trading** at "
-            f"{_tl:,.2f}× the real cost, so each rebalance was chosen net of what it costs to "
-            f"execute and trades worth less than their commission were declined. This lowers "
-            f"turnover; it does not make the forecasts any better. Set it to zero under "
-            f"*Advanced* to see what the same model does when it believes trading is free.")
-    else:
-        st.caption(
-            "**The optimiser was not charged for its own trading** on this run — weights were "
-            "chosen as if execution were free and the cost was deducted afterwards, so the "
-            "turnover above is higher than a cost-aware version would have produced.")
+    st.caption(
+        "**No trading costs, taxes or borrowing charges are modelled anywhere in this app.** "
+        "Every figure is a gross, frictionless result. Your own costs come off the top of it, "
+        "and they are larger the more often you trade — so read the higher-frequency horizons "
+        "as the most flattered, not the best.")
 
     # ---- volatility-targeting overlay: did it earn its keep? ----
     if bt.get("vt_applied") and bt.get("unscaled") is not None:
@@ -3121,8 +2651,7 @@ def _render_holdings(res, bc, weights):
                    "weighting — and the posterior is built from today's market weights and a "
                    "historical covariance matrix, neither of which predicts anything. Treat it as "
                    "a description of the inputs, not of the future. The out-of-sample backtest is "
-                   "the only number here with any predictive claim attached, and it is one path.",
-              delta=f"{-res['borrow_cost_annual']*100:,.2f}% borrow" if res["short_gross"] > 0 else None)
+                   "the only number here with any predictive claim attached, and it is one path.")
     m2.metric("Annual volatility", f"{res['port_vol']*100:,.2f}%")
     m3.metric("Sharpe ratio", f"{res['port_sharpe']:,.2f}")
     m4.metric("Names held", f"{int(np.sum(np.abs(weights) > 1e-4))}")
@@ -3155,7 +2684,7 @@ def _render_trade_list(res, bc):
 
     t1, t2, t3, t4 = st.columns(4)
     t1.metric("Hold — no action", f"{n_hold}",
-              help="The target moved, but not far enough to repay the commission of trading it.")
+              help="Already within one lot of the target, so there is no order to place.")
     t2.metric("Buy", f"{n_buy}")
     t3.metric("Sell", f"{n_sell}")
     t4.metric("Value to trade", f"{gross_traded:,.0f} {bc}",
@@ -3165,20 +2694,14 @@ def _render_trade_list(res, bc):
         f"Your holdings are worth **{res['held_value']:,.0f} {bc}**"
         + (f", plus **{res['new_cash']:,.0f} {bc}** of new cash you asked to deploy"
            if res.get("new_cash", 0) > 0 else "")
-        + f" — a book of **{cap:,.0f} {bc}**. Rows marked HOLD are positions the model "
-          f"chose to leave alone: it is charged for trading, so it moves a weight only when "
-          f"the expected gain covers the cost of getting there. That is the same rule the "
-          f"backtest runs under.")
+        + f" — a book of **{cap:,.0f} {bc}**. Rows marked HOLD are already within one "
+          f"tradeable lot of their target, so there is nothing to place. No trading costs are "
+          f"modelled: judge for yourself whether a small adjustment is worth your brokerage.")
 
-    if res.get("live_turnover_cost", 0) <= 0:
-        st.info("Trading is currently **not** being charged to the optimiser (the turnover "
-                "setting under *Advanced* is off), so this list will name more trades than a "
-                "cost-aware run would.")
 
     show = df[df["Action"].isin(["BUY", "SELL"])] if (n_buy + n_sell) else df
     if not (n_buy + n_sell):
-        st.success("**Nothing to do.** Every position is already close enough to its target "
-                   "that trading would cost more than it is worth.")
+        st.success("**Nothing to do.** Every position is already within one lot of its target.")
     st.dataframe(pretty_df(show[res["detail_cols"]], res["exec_fmt"]),
                  hide_index=True, width='stretch')
     if n_hold and (n_buy + n_sell):
@@ -3194,25 +2717,9 @@ def _render_trade_list(res, bc):
                "estimate of what any of it will earn.")
 
 
-def _render_when_to_trade(res, bt=None):
-    """How often this portfolio is actually worth touching, given its costs."""
-    be = res.get("breakeven_drift")
-    if be is None:
-        return
-    obs = None
-    if bt is not None and bt.get("avg_turnover") is not None:
-        obs = float(bt["avg_turnover"])
-    head, detail, sev = rebalance_guidance(
-        res.get("tc_bps", 0.0), res.get("reb_per_year", 12.0), be,
-        res.get("max_weight_pct", 100.0), observed_turnover=obs)
-    st.markdown("#### When is it worth trading again?")
-    (st.info if sev == "none" else st.success)(f"**{head}**\n\n{detail}")
-
-
 def _render_execution(res, bc):
     if res.get("has_holdings"):
         _render_trade_list(res, bc)
-        _render_when_to_trade(res, res.get("bt"))
         return
     # Implementability first — a beautiful set of weights you cannot actually
     # buy is not a portfolio, and the rounding error is invisible in every
@@ -3274,7 +2781,6 @@ def _render_execution(res, bc):
     if res.get("fx_warn"):
         st.warning("Some tickers could not be converted into the reporting currency; their shares "
                    "are blank above.")
-    _render_when_to_trade(res, res.get("bt"))
 
 
 def _render_saved_runs(res):
@@ -3444,7 +2950,7 @@ def main():
     _reb_periods = max(1, int(round(hcfg["rebal"] * FREQ_PER_YEAR[ret_freq]
                                     / FREQ_PER_YEAR[hcfg["freq"]])))
     use_log = True; cvar_alpha = 0.95
-    tc_bps = market_default(market_name, "tc_bps"); borrow_bps = 50.0; resample_n = 0
+    resample_n = 0
     do_backtest = True; train_frac = DEFAULT_TRAIN_FRAC
     # A 12% single-name cap is sensible for 25 stocks and wrong for 13 asset
     # classes, where the market portfolio itself is legitimately concentrated
@@ -3471,11 +2977,6 @@ def main():
     omega_method = "Idzorek confidence"
     use_posterior_cov = False
     backtest_uses_views = False
-    # Simple mode gets the penalty at its honest strength without a control:
-    # charging the optimiser the true cost of its own trade is not an expert
-    # option, it is what "the backtest is realistic" means.
-    use_turnover_pen = True
-    turnover_lambda = 1.0
 
     if mode == "Advanced":
         with st.expander("Black-Litterman settings — τ, δ, Ω", expanded=True):
@@ -3560,16 +3061,12 @@ def main():
                 ret_freq = st.selectbox("Return frequency", ["Daily", "Weekly", "Monthly"],
                                         index=["Daily", "Weekly", "Monthly"].index(hcfg["freq"]))
                 use_log = st.checkbox("Use log returns", value=True)
-            c1, c2, c3 = st.columns(3)
+            c1, c3 = st.columns(2)
             with c1:
-                tc_bps = st.number_input(
-                    "Transaction cost (bps)", 0.0, 500.0,
-                    float(market_default(market_name, "tc_bps")), 1.0,
-                    key=f"tc_{market_name}",
-                    help="All-in round-trip cost, pre-set per market. India is higher than the US "
-                         "because of STT and stamp duty; the UK and Hong Kong carry stamp too.")
-            with c2:
-                borrow_bps = st.number_input("Short borrow cost (bps/yr)", 0.0, 2000.0, 50.0, 5.0)
+                st.caption("**No costs are modelled.** Trading costs, taxes and borrowing "
+                           "charges are deliberately left out: this app answers *how should "
+                           "the money be allocated*, not *what will my broker charge*. Every "
+                           "return shown is gross of all of it.")
             with c3:
                 resample_n = st.slider("Resampling draws (Michaud)", 0, 100, 0, 5,
                                        help="0 = off. Higher = sturdier weights but slower.")
@@ -3643,25 +3140,6 @@ def main():
                                                        "is look-ahead bias and cannot be evidence of "
                                                        "anything. Useful only to see how views propagate.")
 
-            tt1, tt2 = st.columns([1, 2])
-            with tt1:
-                use_turnover_pen = st.checkbox(
-                    "Charge the optimiser for trading", value=True,
-                    help="ON (default) = each rebalance is chosen NET of what the trade costs "
-                         "to execute, so the model declines trades worth less than their own "
-                         "commission. OFF = the old behaviour: weights are picked as if trading "
-                         "were free and the bill arrives afterwards.")
-            with tt2:
-                turnover_lambda = st.slider(
-                    "How hard to charge it (×true cost)", 0.0, 5.0, 1.0, 0.25,
-                    disabled=not use_turnover_pen,
-                    help="1.0 = charge exactly the real cost, which is the honest setting. "
-                         "Above 1.0 deliberately over-charges, which is the standard defence "
-                         "against expected returns being noisier than they look: it makes the "
-                         "portfolio hold still unless the case for moving is strong. 0 is the "
-                         "same as switching it off.")
-            if not use_turnover_pen:
-                turnover_lambda = 0.0
 
     top_n = n_holdings
     native_ccy = MARKETS[market_name]["currency"]
@@ -3687,7 +3165,7 @@ def main():
     if mode != "Advanced":
         st.caption(
             f"**Recommended settings applied automatically for {native_ccy}:** risk-free "
-            f"{float(rf_annual)*100:,.1f}% · trading cost {tc_bps:,.0f} bps · max {max_weight_pct}% per "
+            f"{float(rf_annual)*100:,.1f}% · max {max_weight_pct}% per "
             f"stock · δ implied from the market · Ω Idzorek · τ {tau:.2f} · view confidence "
             f"{DEFAULT_VIEW_CONFIDENCE:,.0f}% · backtest trains on {train_frac:.0%} of history. "
             f"Switch to **Advanced** to change any of them.")
@@ -4127,28 +3605,17 @@ def main():
             invest_capital = (held_value + float(new_cash)) if has_holdings else total_capital
             # Charge the live optimiser at the same rate the backtest used, so
             # the portfolio on screen is the one the backtest measured.
-            live_turnover_cost = ((tc_bps / 1e4) * (freq_per_year / max(_reb_periods, 1))
-                                  * float(turnover_lambda or 0.0))
-            if has_holdings and float(new_cash) > 0 and held_value > 0:
-                # New cash dilutes every existing weight, so w_prev must be
-                # stated as a share of the POST-contribution book or the model
-                # sees phantom selling in every line.
-                w_prev_live = w_prev_live * (held_value / invest_capital)
-
             try:
-                _wp = w_prev_live if (has_holdings and live_turnover_cost > 0) else None
                 if resample_n and resample_n > 0:
                     stack = resample_stack(objective, mu.values, Sigma_used, rf, stance, max_weight,
                                            gross_limit, cvar_alpha, freq_per_year, resample_n,
-                                           w_prev=_wp, turnover_cost=live_turnover_cost,
                                            delta=delta)
                     weights = stack.mean(axis=0)
                     wstd = stack.std(axis=0)
                 else:
                     weights = optimize_portfolio(objective, mu.values, Sigma_used, returns.values, rf,
                                                  stance, max_weight, gross_limit, cvar_alpha,
-                                                 freq_per_year, w_prev=_wp,
-                                                 turnover_cost=live_turnover_cost, delta=delta)
+                                                 freq_per_year, delta=delta)
                     wstd = None
             except Exception as e:
                 st.error(f"Optimisation failed: {e}")
@@ -4165,41 +3632,14 @@ def main():
             except Exception:
                 w_markowitz = None
 
-            # How far a position has to drift before correcting it pays for
-            # itself, given THIS market's costs and THIS horizon's frequency.
-            # Computed from the user's own Sigma rather than asserted, because
-            # the answer differs by an order of magnitude between 25 bps
-            # monthly and 10 bps yearly.
-            _reb_per_year_live = freq_per_year / max(_reb_periods, 1)
-            _be_cost = (tc_bps / 1e4) * _reb_per_year_live
-            _lb_be, _ub_be, _net_be = _stance_bounds(
-                stance, max_weight if max_weight is not None else 1.0, len(usable))
-            try:
-                _be_drift = breakeven_drift(
-                    weights,
-                    lambda wp: optimize_portfolio(
-                        objective, mu.values, Sigma_used, returns.values, rf, stance,
-                        max_weight, gross_limit, cvar_alpha, freq_per_year,
-                        w_prev=wp, turnover_cost=_be_cost, delta=delta),
-                    _lb_be, _ub_be, _net_be)
-            except Exception:
-                _be_drift = None
-
             port_ret, port_vol, port_sharpe = portfolio_stats(weights, mu.values, Sigma_used, rf)
             mkt_ret_bl, mkt_vol_bl, _ = portfolio_stats(w_mkt, mu.values, Sigma_used, rf)
             gross = float(np.sum(np.abs(weights)))
             net = float(np.sum(weights))
             short_gross = float(np.sum(np.clip(-weights, 0, None)))
-            borrow_cost_annual = (borrow_bps / 1e4) * short_gross
-            tc_cost = (tc_bps / 1e4) * gross
-            net_expected = port_ret - borrow_cost_annual
-
             exposure_caption = (f"Gross exposure {gross*100:,.0f}%, net {net*100:,.0f}%. "
-                                f"Est. build cost {tc_cost*total_capital:,.0f} {base_currency} "
-                                f"({tc_bps:.0f} bps of turnover); annual short-borrow cost "
-                                f"{borrow_cost_annual*total_capital:,.0f} {base_currency}. "
-                                f"Return after borrow ≈ {net_expected*100:,.2f}%. "
-                                f"Negative weights are shorts.")
+                                f"Negative weights are shorts. No trading, borrowing or tax "
+                                f"costs are modelled — every figure here is gross.")
 
             wdf = {"Ticker": usable,
                    "Equilibrium π %": bl["pi_total"] * 100,
@@ -4281,7 +3721,7 @@ def main():
                 bt_args = dict(freq=ret_freq, use_log=use_log, cov_method=cov_method,
                                freq_per_year=freq_per_year, rf=rf, stance=stance,
                                max_weight=max_weight, gross_limit=gross_limit, objective=objective,
-                               alpha=cvar_alpha, tc_bps=tc_bps, borrow_bps=borrow_bps,
+                               alpha=cvar_alpha,
                                train_frac=train_frac, resample_n=min(resample_n, 10),
                                rebalance_periods=_reb_periods, rebal_label=hcfg["rebal_label"],
                                bench_prices=bench_prices, fx_prices=fx_prices, bench_label=bench_lbl,
@@ -4293,7 +3733,7 @@ def main():
                                                 and vol_target_mode.startswith("Relative")
                                                 else None),
                                vol_lookback=vol_lookback, vol_max_leverage=vol_max_lev,
-                               turnover_lambda=turnover_lambda, delta=delta)
+                               delta=delta, capital=total_capital)
                 run_views = bool(backtest_uses_views and bl["has_views"])
                 if sys_engine is not None:
                     # Systematic views can be tested honestly, so always run the
@@ -4431,13 +3871,10 @@ def main():
 
             st.session_state["res"] = {
                 "base_currency": base_currency, "total_capital": invest_capital, "usable": usable,
-                "breakeven_drift": _be_drift, "reb_per_year": _reb_per_year_live,
-                "tc_bps": float(tc_bps), "max_weight_pct": float(max_weight_pct),
+                "max_weight_pct": float(max_weight_pct),
                 "has_holdings": has_holdings, "held_value": held_value,
                 "held_problems": held_problems, "n_held_priced": n_held_priced,
                 "new_cash": float(new_cash), "w_prev_live": w_prev_live,
-                "live_turnover_cost": live_turnover_cost,
-                "turnover_lambda": float(turnover_lambda or 0.0),
                 "n_assets": n_assets, "freq_per_year": freq_per_year, "ret_freq": ret_freq,
                 "weights": weights, "mu_vals": mu.values, "sigma": sigma_vec,
                 "pi_total": bl["pi_total"], "mu_total": bl["mu_total"],
@@ -4450,7 +3887,6 @@ def main():
                 "port_ret": port_ret, "port_vol": port_vol, "port_sharpe": port_sharpe,
                 "mkt_ret": mkt_ret_bl, "mkt_vol": mkt_vol_bl,
                 "gross": gross, "net": net, "short_gross": short_gross,
-                "borrow_cost_annual": borrow_cost_annual, "tc_cost": tc_cost,
                 "settings_caption": settings_caption, "exposure_caption": exposure_caption,
                 "universe_note": uni["universe_note"],
                 "weights_df": weights_df, "has_stability": wstd is not None,
