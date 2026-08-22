@@ -953,6 +953,53 @@ check("no holdings gives no value and no weights",
       bl.holdings_to_weights({}, _UNI, _px)[1] == 0.0)
 
 # =========================================================
+# ANNUALISING BY REAL TIME, NOT NOMINAL TRADING DAYS
+# =========================================================
+print("\n--- calendar-correct annualisation ---")
+
+# 2,035 daily observations spanning 8.225 calendar years is 247.4 trading days
+# a year, not 252. Annualising by the nominal figure treats the window as
+# shorter than it was and inflates every 'per year' number.
+_pr = np.full(2035, (2.78466 ** (1 / 2035)) - 1.0)     # exactly +178.466% overall
+_nom = bl.perf_metrics(_pr, 252, 0.06)
+_cal = bl.perf_metrics(_pr, 252, 0.06, years=8.225)
+check("nominal annualisation reproduces the old, higher figure",
+      abs(_nom["ann_ret"] - 0.1352) < 5e-4, f"{_nom['ann_ret']:.4%}")
+check("calendar annualisation is lower and matches the hand calculation",
+      abs(_cal["ann_ret"] - 0.1326) < 5e-4, f"{_cal['ann_ret']:.4%}")
+check("the overstatement is about a quarter of a point",
+      0.001 < (_nom["ann_ret"] - _cal["ann_ret"]) < 0.004,
+      f"{(_nom['ann_ret']-_cal['ann_ret'])*100:.3f}pp")
+check("total growth is identical either way — only the time base changed",
+      abs(_nom["equity"][-1] - _cal["equity"][-1]) < 1e-12,
+      f"{_nom['equity'][-1]:.6f} vs {_cal['equity'][-1]:.6f}")
+check("volatility is scaled by the same corrected period count",
+      _cal["ann_vol"] <= _nom["ann_vol"] + 1e-12)
+check("years=None falls back to the nominal convention exactly",
+      bl.perf_metrics(_pr, 252, 0.06, years=None)["ann_ret"] == _nom["ann_ret"])
+check("a nonsense span is ignored rather than dividing by zero",
+      bl.perf_metrics(_pr, 252, 0.06, years=0)["ann_ret"] == _nom["ann_ret"])
+
+# End to end: the backtest must report the span it actually covered.
+_bt_cal = bl.run_backtest(_pxb, rebalance_periods=252, rebal_label="yearly", **_BASE)
+if _bt_cal is not None:
+    _dd = _bt_cal["dates"]
+    _true = (_dd[-1] - _dd[0]).days / 365.25
+    check("backtest reports the real calendar span of its test window",
+          abs(_bt_cal["test_years"] - _true) < 1e-9,
+          f"{_bt_cal['test_years']:.4f} vs {_true:.4f}")
+    # The correction is not always downward. Real Indian data runs ~247 trading
+    # days a year, so annualising by 252 overstates; this synthetic fixture uses
+    # bdate_range, which has no holidays at all (~260 a year), so the same fix
+    # moves the number the other way. The point is that it uses the truth,
+    # whichever direction that lies in.
+    _ppy = _bt_cal["n_test"] / _bt_cal["test_years"]
+    check("implied trading days per year is a plausible calendar",
+          240 < _ppy < 263, f"{_ppy:.1f} periods per year")
+    check("a holiday-free fixture implies MORE periods per year than the nominal 252",
+          _ppy > 252, f"{_ppy:.1f} vs nominal 252")
+
+# =========================================================
 print()
 if FAILURES:
     print(f"{len(FAILURES)} FAILED: " + ", ".join(FAILURES))
