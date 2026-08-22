@@ -1,0 +1,30 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # Both suites stub Streamlit and yfinance, so nothing here touches the
+      # network or needs a server. A red badge means the maths broke.
+      - name: Numeric core (183 checks)
+        run: python test_bl_core.py
+
+      - name: End-to-end pipeline (23 checks)
+        run: python test_pipeline.py
