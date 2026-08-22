@@ -1,6 +1,6 @@
 # Black-Litterman Portfolio Model
 
-[![tests](https://github.com/SunnyAlexV/Black-Litterman-model/actions/workflows/tests.yml/badge.svg)](https://github.com/SunnyAlexV/Black-Litterman-model/actions/workflows/tests.yml)
+(https://github.com/SunnyAlexV/Black-Litterman-model/actions/workflows/tests.yml/badge.svg)](https://github.com/SunnyAlexV/Black-Litterman-model/actions/workflows/tests.yml)
 [![live app](https://img.shields.io/badge/live%20app-streamlit-FF4B4B?logo=streamlit&logoColor=white)](https://black-litterman-model.streamlit.app/)
 [![python](https://img.shields.io/badge/python-3.11-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![licence](https://img.shields.io/badge/licence-MIT-black)](LICENSE)
@@ -8,8 +8,6 @@
 **Start from the portfolio the market is already holding, then tilt it only as far as your views — and your confidence in them — justify.**
 
 ### ▶ [Try it live](https://black-litterman-model.streamlit.app/)
-
-![Out-of-sample backtest](docs/backtest.png)
 
 *Out-of-sample walk-forward test: the model against its own equilibrium prior, an equal-weight basket, and the index. Every line is re-derived at each rebalance from data available at that point only.*
 
