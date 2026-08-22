@@ -1,5 +1,6 @@
 # Black-Litterman Portfolio Model
 
+[![tests](https://github.com/SunnyAlexV/Black-Litterman-model/actions/workflows/tests.yml/badge.svg)](https://github.com/SunnyAlexV/Black-Litterman-model/actions/workflows/tests.yml)
 [![live app](https://img.shields.io/badge/live%20app-streamlit-FF4B4B?logo=streamlit&logoColor=white)](https://black-litterman-model.streamlit.app/)
 [![python](https://img.shields.io/badge/python-3.11-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![licence](https://img.shields.io/badge/licence-MIT-black)](LICENSE)
