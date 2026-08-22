@@ -1000,6 +1000,181 @@ if _bt_cal is not None:
           _ppy > 252, f"{_ppy:.1f} vs nominal 252")
 
 # =========================================================
+# ONE HOLDING PERIOD AT A TIME
+# =========================================================
+print("\n--- single holding periods ---")
+
+_hp = {}
+for _lbl, _reb in (("weekly", 5), ("monthly", 21), ("yearly", 252)):
+    _b = bl.run_backtest(_pxb, rebalance_periods=_reb, rebal_label=_lbl, **_BASE)
+    _hp[_lbl] = _b
+
+for _lbl, _reb in (("weekly", 5), ("monthly", 21), ("yearly", 252)):
+    _b = _hp[_lbl]
+    _h = _b["holds"]
+    check(f"{_lbl}: a holding period is recorded for every rebalance",
+          len(_h) == _b["n_rebalances"], f"{len(_h)} holds vs {_b['n_rebalances']} rebalances")
+    check(f"{_lbl}: each hold lasts one horizon (bar the last, which is truncated)",
+          all(x["periods"] == _reb for x in _h[:-1]) and _h[-1]["periods"] <= _reb,
+          f"lengths {sorted({x['periods'] for x in _h})}")
+    check(f"{_lbl}: holds tile the test window with no gaps or overlaps",
+          sum(x["periods"] for x in _h) == _b["n_test"],
+          f"{sum(x['periods'] for x in _h)} vs {_b['n_test']}")
+    check(f"{_lbl}: holds run in date order",
+          all(_h[i]["end"] <= _h[i + 1]["start"] for i in range(len(_h) - 1)))
+
+# Compounding every individual hold must reproduce the headline path exactly.
+# If it does not, the two figures on screen are describing different things.
+for _lbl in ("weekly", "monthly", "yearly"):
+    _b = _hp[_lbl]
+    _chain = float(np.prod([1.0 + x["strat"] for x in _b["holds"]]))
+    _total = float(_b["strat"]["equity"][-1])
+    check(f"{_lbl}: chaining the holds reproduces the compounded result",
+          abs(_chain - _total) < 1e-9, f"{_chain:.10f} vs {_total:.10f}")
+
+# A shorter horizon must give more, smaller holds out of the same window.
+check("shorter horizons yield more samples of the same question",
+      len(_hp["weekly"]["holds"]) > len(_hp["monthly"]["holds"]) > len(_hp["yearly"]["holds"]),
+      f"{len(_hp['weekly']['holds'])} / {len(_hp['monthly']['holds'])} / "
+      f"{len(_hp['yearly']['holds'])}")
+_med = {k: float(np.median([x["strat"] for x in v["holds"]])) for k, v in _hp.items()}
+check("a typical one-year hold is bigger than a typical one-week hold",
+      abs(_med["yearly"]) > abs(_med["weekly"]),
+      " ".join(f"{k} {v*100:+.2f}%" for k, v in _med.items()))
+
+# The single-period figure must never be confused with the compounded one.
+_w = _hp["weekly"]
+check("one hold is far smaller than the whole-window result",
+      abs(_med["weekly"]) < abs(_w["strat"]["equity"][-1] - 1.0) / 10,
+      f"median week {_med['weekly']*100:+.3f}% vs whole window "
+      f"{(_w['strat']['equity'][-1]-1)*100:+.1f}%")
+
+# =========================================================
+# THE HOLDING PERIOD REACHES THE MODEL
+# =========================================================
+print("\n--- horizon-aware covariance ---")
+
+_nv, _Tv = 20, 3780
+_rv = np.random.default_rng(5)
+_bt_v = _rv.uniform(0.7, 1.3, _nv)
+_mktv = _rv.normal(0.0004, 0.011, _Tv)
+_idio = _rv.normal(0, 0.013, (_Tv, _nv))
+for _j in range(_nv):                      # even = mean-reverting, odd = trending
+    _rho = -0.25 if _j % 2 == 0 else 0.25
+    for _t in range(1, _Tv):
+        _idio[_t, _j] += _rho * _idio[_t - 1, _j]
+_Rv = _mktv[:, None] * _bt_v[None, :] + _idio
+_idxv = pd.bdate_range("2011-06-01", periods=_Tv)
+_retsv = pd.DataFrame(_Rv, index=_idxv, columns=[f"N{i}" for i in range(_nv)])
+_covv = bl.estimate_cov(_retsv, "Ledoit-Wolf shrinkage", 252)
+_wmv = _rv.lognormal(0, 0.7, _nv); _wmv = _wmv / _wmv.sum()
+
+# --- the measurement itself ---
+check("a one-period horizon has no variance ratio to apply",
+      np.allclose(bl.variance_ratio(_Rv, 1), 1.0))
+_vr252 = bl.variance_ratio(_Rv, 252)
+check("mean-reverting assets are measured as LESS risky over a long hold",
+      _vr252[0::2].mean() < 0.95, f"reverting VR {_vr252[0::2].mean():.3f}")
+check("trending assets are measured as MORE risky over a long hold",
+      _vr252[1::2].mean() > 1.15, f"trending VR {_vr252[1::2].mean():.3f}")
+check("the two groups are cleanly separated",
+      _vr252[0::2].max() < _vr252[1::2].min(),
+      f"reverting max {_vr252[0::2].max():.3f} vs trending min {_vr252[1::2].min():.3f}")
+
+# An i.i.d. panel must show no horizon effect at all — this is the null.
+_iid = np.random.default_rng(3).normal(0, 0.012, (_Tv, 8))
+check("an i.i.d. panel yields variance ratios of essentially 1",
+      np.abs(bl.variance_ratio(_iid, 252) - 1.0).max() < 0.25,
+      f"worst deviation {np.abs(bl.variance_ratio(_iid, 252) - 1.0).max():.3f}")
+
+# Shrinkage must scale with how many INDEPENDENT windows exist.
+_dev = {h: float(np.abs(bl.variance_ratio(_Rv, h) - 1.0).mean()) for h in (5, 21, 252)}
+check("a short horizon barely moves; a long one is shrunk hardest per window",
+      _dev[5] < _dev[21], f"weekly {_dev[5]:.3f}, monthly {_dev[21]:.3f}, yearly {_dev[252]:.3f}")
+check("variance ratios stay inside their clip bounds",
+      bl.variance_ratio(_Rv, 252).min() >= 0.25 and bl.variance_ratio(_Rv, 252).max() <= 4.0)
+
+# --- applying it ---
+_Sv = bl.apply_variance_ratio(_covv.values, _vr252)
+_c0 = _covv.values / np.outer(np.sqrt(np.diag(_covv.values)), np.sqrt(np.diag(_covv.values)))
+_c1 = _Sv / np.outer(np.sqrt(np.diag(_Sv)), np.sqrt(np.diag(_Sv)))
+check("rescaling variances leaves the correlation matrix untouched",
+      np.abs(_c0 - _c1).max() < 1e-9, f"max corr drift {np.abs(_c0-_c1).max():.2e}")
+check("the rescaled covariance is still positive semi-definite",
+      np.linalg.eigvalsh(_Sv).min() > -1e-10)
+check("variances move in the direction the variance ratio says",
+      np.diag(_Sv)[0] < np.diag(_covv.values)[0]
+      and np.diag(_Sv)[1] > np.diag(_covv.values)[1])
+check("a variance ratio of exactly 1 is a no-op",
+      np.allclose(bl.apply_variance_ratio(_covv.values, np.ones(_nv)), _covv.values, atol=1e-12))
+
+# --- horizon returns ---
+_hr = bl.horizon_returns(_Rv, 21)
+check("horizon returns compound the right number of periods",
+      len(_hr) == len(_Rv) - 21 and _hr.shape[1] == _nv, f"{_hr.shape}")
+check("a single-period horizon returns the input unchanged",
+      np.array_equal(bl.horizon_returns(_Rv, 1), _Rv))
+# Row k spans the price at k to the price at k + h, so it compounds periods
+# k+1..k+h. Pinning the convention matters: an off-by-one here would silently
+# shift every window by a day and nothing else would complain.
+_chk = float(np.prod(1.0 + _Rv[1:22, 0]) - 1.0)
+check("one horizon return equals compounding its own window",
+      abs(_hr[0, 0] - _chk) < 1e-12, f"{_hr[0,0]:.10f} vs {_chk:.10f}")
+check("the window convention is price-to-price, not return-block",
+      abs(_hr[0, 0] - float(np.prod(1.0 + _Rv[:21, 0]) - 1.0)) > 1e-6)
+
+# --- WHERE IT BITES, AND WHERE IT CANNOT ---
+# Black-Litterman with no views reproduces the market portfolio for ANY Sigma:
+# pi is reverse-optimised FROM w_mkt, so optimising it forward returns w_mkt
+# again. Rescaling Sigma by a holding period therefore cannot move a no-view
+# Max Sharpe book -- that is a theorem about the model, not a wiring fault, and
+# it is why the app tells the user to add views or pick a risk-based objective
+# if they want the horizon to matter.
+_Pv = np.zeros((2, _nv)); _Pv[0, 0] = 1.0; _Pv[1, 1] = 1.0
+_Qv = np.array([0.12, 0.12]); _cv = np.array([0.75, 0.75])
+
+def _book(obj, h, views):
+    _vr = bl.variance_ratio(_Rv, h) if h > 1 else np.ones(_nv)
+    _S = bl.apply_variance_ratio(_covv.values, _vr) if h > 1 else _covv.values
+    _d, _ = bl.implied_risk_aversion(_wmv, _S, float(_wmv @ (_retsv.mean().values * 252)) - 0.06)
+    _o = bl.black_litterman(_S, _wmv, 0.06, 0.05, _d,
+                            _Pv if views else np.zeros((0, _nv)),
+                            _Qv if views else np.zeros(0),
+                            _cv if views else np.zeros(0))
+    _R = bl.horizon_returns(_Rv, h) if h > 1 else _Rv
+    return bl.optimize_portfolio(obj, _o["mu_total"], _o["Sigma_used"], _R, 0.06,
+                                 "Long only", 0.12, None, 0.95, 252, R_ppy=252 / h)
+
+def _gap(obj, views):
+    a, b = _book(obj, 1, views), _book(obj, 252, views)
+    return float(np.sum(np.abs(b - a))) / 2 * 100
+
+check("Max Sharpe with NO views cannot be moved by the horizon (BL reproduces its prior)",
+      _gap("Max Sharpe", False) < 2.0, f"{_gap('Max Sharpe', False):.2f}% active share")
+check("Max Sharpe WITH views does respond to the horizon",
+      _gap("Max Sharpe", True) > 3.0, f"{_gap('Max Sharpe', True):.2f}%")
+for _o in ("Min variance", "Min CVaR", "Max Sortino"):
+    check(f"{_o} responds strongly to the horizon with or without views",
+          _gap(_o, False) > 10.0 and _gap(_o, True) > 10.0,
+          f"views off {_gap(_o, False):.1f}%, on {_gap(_o, True):.1f}%")
+
+# --- and it must be switchable off, reproducing the old behaviour exactly ---
+_b_on = bl.run_backtest(_pxb, rebalance_periods=252, rebal_label="yearly",
+                        horizon_aware=True, **_BASE)
+_b_off = bl.run_backtest(_pxb, rebalance_periods=252, rebal_label="yearly",
+                         horizon_aware=False, **_BASE)
+check("horizon_aware=False reproduces the pre-change backtest",
+      _b_off is not None and _b_on is not None
+      and abs(_b_off["strat"]["ann_ret"] - bl.run_backtest(
+          _pxb, rebalance_periods=252, rebal_label="yearly",
+          horizon_aware=False, **_BASE)["strat"]["ann_ret"]) < 1e-12)
+check("a one-period rebalance is unaffected either way",
+      abs(bl.run_backtest(_pxb, rebalance_periods=1, rebal_label="daily",
+                          horizon_aware=True, **_BASE)["strat"]["ann_ret"]
+          - bl.run_backtest(_pxb, rebalance_periods=1, rebal_label="daily",
+                            horizon_aware=False, **_BASE)["strat"]["ann_ret"]) < 1e-12)
+
+# =========================================================
 print()
 if FAILURES:
     print(f"{len(FAILURES)} FAILED: " + ", ".join(FAILURES))
