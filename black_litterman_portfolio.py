@@ -287,7 +287,8 @@ MARKETS = {
     # churn is handled inside the fund. This is also the problem Black and
     # Litterman (1992) actually wrote about — global allocation across markets,
     # not stock selection.
-    "Global multi-asset (ETFs)": {"currency": "USD", "kind": "asset-class", "tickers": [
+    "Global multi-asset (ETFs)": {"currency": "USD", "kind": "asset-class",
+                                 "cross_tz": True, "tickers": [
         "SPY",    # US large cap equity
         "IWM",    # US small cap equity
         "EFA",    # developed ex-US equity
@@ -306,7 +307,8 @@ MARKETS = {
         "XLK", "XLF", "XLV", "XLY", "XLP", "XLE",
         "XLI", "XLB", "XLU", "XLRE", "XLC",
     ]},
-    "Global equity regions (ETFs)": {"currency": "USD", "kind": "asset-class", "tickers": [
+    "Global equity regions (ETFs)": {"currency": "USD", "kind": "asset-class",
+                                    "cross_tz": True, "tickers": [
         "SPY", "IWM", "EFA", "EEM", "EWJ", "EWU", "EWG", "EWY", "EWZ", "INDA", "FXI", "EWC",
     ]},
     "United States — S&P 500": {"currency": "USD", "tickers": [
@@ -2742,7 +2744,30 @@ def main():
 
     # Recommended defaults — used as-is in Simple mode, editable in Advanced.
     objective = "Max Sharpe"; cov_method = "Ledoit-Wolf shrinkage"
-    ret_freq = hcfg["freq"]; use_log = True; cvar_alpha = 0.95
+    # Return frequency is a question about the ASSETS, not about how often you
+    # trade. Daily data gives five times more observations, which is what Sigma
+    # wants — but when assets trade in different sessions (SPY at 21:00 IST,
+    # EFA at 16:30 CET, EEM spanning both), a day's "simultaneous" returns are
+    # not simultaneous at all, and daily correlations come out badly understated.
+    # Measured on simulated panels, comparing daily-annualised against
+    # weekly-annualised Sigma:
+    #
+    #   synchronous, no autocorrelation        pi differs by 0.38pp   <- daily fine
+    #   synchronous, AR(1)=0.10                pi differs by 1.30pp
+    #   NON-synchronous sessions               pi differs by 1.61pp
+    #   both (global multi-asset ETFs)         pi differs by 2.36pp   <- daily wrong
+    #
+    # So: daily for a single-exchange universe (all NSE, all NYSE), weekly when
+    # the universe spans time zones. Every horizon within a universe still sees
+    # identical data — the frequency varies by what is being held, not by how
+    # often it is traded.
+    _cross_tz = bool(MARKETS[market_name].get("cross_tz"))
+    ret_freq = "Weekly" if _cross_tz else hcfg["freq"]
+    # hcfg["rebal"] counts DAILY periods, so it must be rescaled if the returns
+    # are weekly — otherwise "rebalance every 5" would mean five weeks.
+    _reb_periods = max(1, int(round(hcfg["rebal"] * FREQ_PER_YEAR[ret_freq]
+                                    / FREQ_PER_YEAR[hcfg["freq"]])))
+    use_log = True; cvar_alpha = 0.95
     tc_bps = market_default(market_name, "tc_bps"); borrow_bps = 50.0; resample_n = 0
     do_backtest = True; train_frac = DEFAULT_TRAIN_FRAC
     # A 12% single-name cap is sensible for 25 stocks and wrong for 13 asset
@@ -2949,7 +2974,7 @@ def main():
 
     # All three horizons now see identical data, so none is "the good one".
     # State the actual trade-off neutrally instead of steering.
-    _reb_per_year = FREQ_PER_YEAR[hcfg["freq"]] / hcfg["rebal"]
+    _reb_per_year = FREQ_PER_YEAR[ret_freq] / _reb_periods
     st.caption(
         f"**All three horizons estimate from the same {hcfg['years']}-year daily history.** They "
         f"differ only in how often you trade: this one rebalances about "
@@ -3189,7 +3214,7 @@ def main():
 
             with st.spinner("Measuring how often this rule has been right..."):
                 hr, nchecks = engine_hit_rate(uni["prices"], sys_engine, uni["freq_per_year"],
-                                              holding_periods=hcfg["rebal"], n_pairs=sys_n_pairs)
+                                              holding_periods=_reb_periods, n_pairs=sys_n_pairs)
                 sys_conf, sys_conf_note = confidence_from_hit_rate(hr, nchecks)
                 Ps, Qs, cs, sys_labels = systematic_views(
                     uni["prices"], usable, sys_engine, uni["freq_per_year"],
@@ -3460,7 +3485,7 @@ def main():
                             # views this genuinely tests whether views add value.
                             px_now = prices.loc[:train_returns.index[-1]]
                             hr_t, nc_t = _cached_hit_rate(px_now, engine, freq_per_year,
-                                                          hcfg["rebal"])
+                                                          _reb_periods)
                             c_t, _ = confidence_from_hit_rate(hr_t, nc_t)
                             Pe, Qe, ce, _lab = systematic_views(
                                 px_now, usable, engine, freq_per_year,
@@ -3485,7 +3510,7 @@ def main():
                                max_weight=max_weight, gross_limit=gross_limit, objective=objective,
                                alpha=cvar_alpha, tc_bps=tc_bps, borrow_bps=borrow_bps,
                                train_frac=train_frac, resample_n=min(resample_n, 10),
-                               rebalance_periods=hcfg["rebal"], rebal_label=hcfg["rebal_label"],
+                               rebalance_periods=_reb_periods, rebal_label=hcfg["rebal_label"],
                                bench_prices=bench_prices, fx_prices=fx_prices, bench_label=bench_lbl,
                                caps_weights=w_mkt,
                                vol_target=((vol_target_pct / 100.0) if use_vol_target
