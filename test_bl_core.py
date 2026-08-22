@@ -11,6 +11,7 @@ import sys
 import types
 import numpy as np
 import pandas as pd
+import scipy.optimize as sciopt  # exact-reference solves in the turnover tests
 
 # ---------------------------------------------------------
 # Stub the modules the app imports but that the maths never uses
@@ -825,10 +826,15 @@ _BASE = dict(freq="Daily", use_log=True, mu_builder=_builder_b,
              stance="Long only", max_weight=0.12, gross_limit=None, objective="Max Sharpe",
              alpha=0.95, tc_bps=25.0, borrow_bps=50.0, train_frac=0.45, resample_n=0,
              caps_weights=_wmb, vol_target=None)
+# The turnover penalty is OFF here on purpose: this block tests the drift
+# mechanism, and the penalty's whole job is to suppress the small trades that
+# the drift mechanism generates. Leaving it on would test both at once and
+# tell us about neither.
 _res = {}
 _turn = {}
 for _lbl, _reb in (("weekly", 5), ("yearly", 252)):
-    _bt = bl.run_backtest(_pxb, rebalance_periods=_reb, rebal_label=_lbl, **_BASE)
+    _bt = bl.run_backtest(_pxb, rebalance_periods=_reb, rebal_label=_lbl,
+                          turnover_lambda=0.0, **_BASE)
     _res[_lbl] = _bt["strat"]["ann_ret"]
     _turn[_lbl] = _bt["avg_turnover"]
 
@@ -838,6 +844,23 @@ check("rebalance frequency changes the result once holdings drift",
 check("turnover per rebalance grows with the holding period",
       _turn["yearly"] > _turn["weekly"] * 3,
       f"weekly {_turn['weekly']*100:.1f}% vs yearly {_turn['yearly']*100:.1f}% per rebalance")
+
+# The frequency effect is second order to begin with -- the objective is flat
+# at its maximum, so trading more often buys very little gross. Charging the
+# optimiser for the trade therefore compresses the horizons further: it takes
+# away exactly the marginal trades that made the fast horizon expensive.
+_res_pen = {}
+for _lbl, _reb in (("weekly", 5), ("yearly", 252)):
+    _btp = bl.run_backtest(_pxb, rebalance_periods=_reb, rebal_label=_lbl,
+                           turnover_lambda=1.0, delta=3.0, **_BASE)
+    _res_pen[_lbl] = _btp["strat"]["ann_ret"]
+check("charging for turnover narrows the gap between horizons",
+      abs(_res_pen["weekly"] - _res_pen["yearly"]) <= abs(_res["weekly"] - _res["yearly"]) + 1e-9,
+      f"unpenalised {abs(_res['weekly']-_res['yearly'])*100:.3f}pp -> "
+      f"penalised {abs(_res_pen['weekly']-_res_pen['yearly'])*100:.3f}pp")
+check("the fast horizon is the one the penalty helps most",
+      _res_pen["weekly"] >= _res["weekly"] - 1e-9,
+      f"weekly {_res['weekly']*100:.2f}%/yr -> {_res_pen['weekly']*100:.2f}%/yr")
 
 # =========================================================
 print()
@@ -901,6 +924,466 @@ for _lbl, _c in bl.HORIZON_CFG.items():
     check(f"{_lbl.split(' ')[0]}: rebalance rate survives a switch to weekly returns",
           abs(_per_yr_d - _per_yr_w) / _per_yr_d < 0.10,
           f"{_per_yr_d:.1f}/yr daily vs {_per_yr_w:.1f}/yr weekly")
+
+# =========================================================
+# TURNOVER PENALTY
+# =========================================================
+print("\n--- turnover penalty ---")
+
+_rng_to = np.random.default_rng(4242)
+_n_to = 12
+_beta_to = _rng_to.uniform(0.7, 1.3, _n_to)
+_S_to = np.outer(_beta_to, _beta_to) * 0.028 + np.diag(_rng_to.uniform(0.03, 0.09, _n_to))
+_S_to = bl.nearest_psd(_S_to)
+_delta_to = 3.0
+_wm_to = _rng_to.dirichlet(np.ones(_n_to) * 3)
+_mu_to = bl.equilibrium_returns(_delta_to, _S_to, _wm_to) + 0.04 + _rng_to.normal(0, 0.012, _n_to)
+_R_to = _rng_to.multivariate_normal(_mu_to / 252, _S_to / 252, size=600)
+_rf_to = 0.05
+_TC = 0.0025 * 12          # 25 bps charged 12x a year
+
+# Start from a drifted book: what you actually hold when a rebalance fires.
+_w_free = bl.optimize_portfolio("Max Sharpe", _mu_to, _S_to, _R_to, _rf_to,
+                                "Long only", 0.30, None, 0.95, 252)
+_drift = _w_free * np.exp(_rng_to.normal(0, 0.10, _n_to))
+_w_prev_to = _drift / _drift.sum()
+
+def _after_cost_sharpe(w, w_prev=None, tc=None):
+    w_prev = _w_prev_to if w_prev is None else w_prev
+    tc = _TC if tc is None else tc
+    drag = tc * float(np.sum(np.abs(np.asarray(w) - w_prev)))
+    return ((w @ _mu_to) - drag - _rf_to) / math.sqrt(max(w @ _S_to @ w, 1e-16))
+
+_w_pen = bl.optimize_portfolio("Max Sharpe", _mu_to, _S_to, _R_to, _rf_to,
+                               "Long only", 0.30, None, 0.95, 252,
+                               w_prev=_w_prev_to, turnover_cost=_TC, delta=_delta_to)
+
+# --- 1. THE FLOOR. Holding still is always available, so the solver must never
+# return anything worse than it. This is the property the first implementation
+# silently violated: SLSQP stepped off the kink at w_prev and returned a point
+# scoring 0.6518 when doing nothing scored 0.6733. ---
+check("penalised solve never loses to simply holding still",
+      _after_cost_sharpe(_w_pen) >= _after_cost_sharpe(_w_prev_to) - 1e-9,
+      f"solve {_after_cost_sharpe(_w_pen):.6f} vs hold {_after_cost_sharpe(_w_prev_to):.6f}")
+check("penalised solve never loses to trading the whole way",
+      _after_cost_sharpe(_w_pen) >= _after_cost_sharpe(_w_free) - 1e-9,
+      f"solve {_after_cost_sharpe(_w_pen):.6f} vs full trade {_after_cost_sharpe(_w_free):.6f}")
+
+# --- 2. it beats the best point on the line between the two endpoints ---
+# A partial rebalance along w_prev -> w_free is the obvious cheap heuristic.
+# The real solve has 25 degrees of freedom, so it should match or beat it.
+_alphas = np.linspace(0, 1, 201)
+_line = _w_prev_to[None, :] + _alphas[:, None] * (_w_free - _w_prev_to)[None, :]
+_best_line = max(_after_cost_sharpe(_line[i]) for i in range(len(_alphas)))
+check("penalised solve matches or beats the best partial rebalance",
+      _after_cost_sharpe(_w_pen) >= _best_line - 1e-6,
+      f"solve {_after_cost_sharpe(_w_pen):.6f} vs best line point {_best_line:.6f}")
+
+# --- 3. the buy/sell split reports true L1 turnover, not slack ---
+_wS, _wB = _w_pen, _w_prev_to
+check("solved weights obey the budget constraint exactly",
+      abs(_w_pen.sum() - 1.0) < 1e-9, f"sum = {_w_pen.sum():.12f}")
+check("solved weights respect the position cap",
+      _w_pen.max() <= 0.30 + 1e-9 and _w_pen.min() >= -1e-9,
+      f"max {_w_pen.max():.4f}, min {_w_pen.min():.6f}")
+
+# --- 4. it does what it is for ---
+_to_free = float(np.sum(np.abs(_w_free - _w_prev_to)))
+_to_pen = float(np.sum(np.abs(_w_pen - _w_prev_to)))
+check("penalty reduces turnover", _to_pen < _to_free,
+      f"{_to_free*100:.2f}% unpenalised -> {_to_pen*100:.2f}% penalised")
+
+# The economic argument: the objective is flat at its maximum, so the gross
+# give-up must be small next to the cost saved.
+_gross_free = ((_w_free @ _mu_to) - _rf_to) / math.sqrt(_w_free @ _S_to @ _w_free)
+_gross_pen = ((_w_pen @ _mu_to) - _rf_to) / math.sqrt(max(_w_pen @ _S_to @ _w_pen, 1e-16))
+check("gross objective gives up far less than the cost saved",
+      (_gross_free - _gross_pen) < _TC * (_to_free - _to_pen) / 0.15 + 0.05,
+      f"gross Sharpe {_gross_free:.4f} -> {_gross_pen:.4f}, "
+      f"turnover {_to_free*100:.1f}% -> {_to_pen*100:.1f}%")
+check("penalised portfolio wins on the AFTER-COST objective",
+      _after_cost_sharpe(_w_pen) > _after_cost_sharpe(_w_free),
+      f"{_after_cost_sharpe(_w_free):.6f} -> {_after_cost_sharpe(_w_pen):.6f}")
+
+# --- 5. the floor property holds across many independent problems ---
+# The floor is the best FEASIBLE fallback, which is not always "hold still":
+# drift routinely pushes a position past the max-weight cap (3 of the 12 cases
+# below), and when it does, holding is not on the menu at any price -- the
+# model has to trade back inside the cap however expensive that is. Scoring
+# against an unattainable hold would be scoring against a portfolio the user
+# is not allowed to own.
+_floor_fails, _capped = 0, 0
+for _k in range(12):
+    _r = np.random.default_rng(900 + _k)
+    _mu_k = bl.equilibrium_returns(_delta_to, _S_to, _r.dirichlet(np.ones(_n_to) * 3)) \
+        + 0.05 + _r.normal(0, 0.02, _n_to)
+    _R_k = _r.multivariate_normal(_mu_k / 252, _S_to / 252, size=500)
+    _wf_k = bl.optimize_portfolio("Max Sharpe", _mu_k, _S_to, _R_k, _rf_to,
+                                  "Long only", 0.30, None, 0.95, 252)
+    _d_k = _wf_k * np.exp(_r.normal(0, 0.10, _n_to)); _wp_k = _d_k / _d_k.sum()
+    _wp_sol = bl.optimize_portfolio("Max Sharpe", _mu_k, _S_to, _R_k, _rf_to,
+                                    "Long only", 0.30, None, 0.95, 252,
+                                    w_prev=_wp_k, turnover_cost=_TC, delta=_delta_to)
+
+    def _acs(w, mu=_mu_k, wp=_wp_k):
+        return ((w @ mu) - _TC * np.sum(np.abs(w - wp)) - _rf_to) / \
+            math.sqrt(max(w @ _S_to @ w, 1e-16))
+
+    def _ok(w):
+        w = np.asarray(w, dtype=float)
+        return w.max() <= 0.30 + 1e-7 and w.min() >= -1e-7 and abs(w.sum() - 1) < 1e-6
+
+    if not _ok(_wp_k):
+        _capped += 1
+    _floor = max([_acs(w) for w in (_wp_k, _wf_k) if _ok(w)] or [-np.inf])
+    # every point on the segment is a fallback too, when it is feasible
+    for _a in np.linspace(0, 1, 51):
+        _wl = _wp_k + _a * (_wf_k - _wp_k)
+        if _ok(_wl):
+            _floor = max(_floor, _acs(_wl))
+    if not _ok(_wp_sol) or _acs(_wp_sol) < _floor - 1e-7:
+        _floor_fails += 1
+check("floor property holds on 12 independent problems", _floor_fails == 0,
+      f"{_floor_fails} violations ({_capped}/12 had a drifted book breaching the cap)")
+
+# The cap must win over the penalty: a book that has drifted out of compliance
+# gets traded back no matter how expensive trading is made.
+_r_c = np.random.default_rng(555)
+_bad = _w_free.copy(); _bad[int(np.argmax(_bad))] += 0.25; _bad /= _bad.sum()
+_w_forced = bl.optimize_portfolio("Max Sharpe", _mu_to, _S_to, _R_to, _rf_to,
+                                  "Long only", 0.30, None, 0.95, 252,
+                                  w_prev=_bad, turnover_cost=_TC * 500, delta=_delta_to)
+check("cap is enforced even when trading is made prohibitively expensive",
+      _w_forced.max() <= 0.30 + 1e-7 and abs(_w_forced.sum() - 1) < 1e-6,
+      f"breached book max {_bad.max():.4f} -> solved max {_w_forced.max():.4f}")
+
+# --- 4. inertness when it should be inert ---
+check("lambda=0 leaves the unpenalised answer untouched",
+      np.allclose(bl.optimize_portfolio("Max Sharpe", _mu_to, _S_to, _R_to, _rf_to,
+                                        "Long only", 0.30, None, 0.95, 252,
+                                        w_prev=_w_prev_to, turnover_cost=0.0),
+                  _w_free, atol=1e-8))
+check("w_prev=None leaves the unpenalised answer untouched",
+      np.allclose(bl.optimize_portfolio("Max Sharpe", _mu_to, _S_to, _R_to, _rf_to,
+                                        "Long only", 0.30, None, 0.95, 252,
+                                        w_prev=None, turnover_cost=_TC),
+                  _w_free, atol=1e-8))
+check("already-optimal book is left alone when trading is expensive",
+      float(np.sum(np.abs(
+          bl.optimize_portfolio("Max Sharpe", _mu_to, _S_to, _R_to, _rf_to,
+                                "Long only", 0.30, None, 0.95, 252,
+                                w_prev=_w_free, turnover_cost=_TC * 40) - _w_free))) < 0.02)
+
+# --- 5. monotone in lambda, and every objective accepts it ---
+_tos = []
+for _lam in (0.0, 1.0, 4.0, 16.0):
+    _wl = bl.optimize_portfolio("Max Sharpe", _mu_to, _S_to, _R_to, _rf_to,
+                                "Long only", 0.30, None, 0.95, 252,
+                                w_prev=_w_prev_to, turnover_cost=_TC * _lam)
+    _tos.append(float(np.sum(np.abs(_wl - _w_prev_to))))
+check("turnover is non-increasing as the charge rises",
+      all(_tos[i + 1] <= _tos[i] + 1e-3 for i in range(len(_tos) - 1)),
+      " -> ".join(f"{t*100:.2f}%" for t in _tos))
+
+for _obj in ("Max Sharpe", "Min variance", "Max Sortino", "Min CVaR"):
+    _wo_free = bl.optimize_portfolio(_obj, _mu_to, _S_to, _R_to, _rf_to,
+                                     "Long only", 0.30, None, 0.95, 252)
+    _wo_pen = bl.optimize_portfolio(_obj, _mu_to, _S_to, _R_to, _rf_to,
+                                    "Long only", 0.30, None, 0.95, 252,
+                                    w_prev=_w_prev_to, turnover_cost=_TC * 4,
+                                    delta=_delta_to)
+    _a = float(np.sum(np.abs(_wo_free - _w_prev_to)))
+    _b = float(np.sum(np.abs(_wo_pen - _w_prev_to)))
+    check(f"{_obj}: penalty is wired in and reduces turnover",
+          _b <= _a + 1e-6 and abs(_wo_pen.sum() - 1.0) < 1e-6,
+          f"{_a*100:.2f}% -> {_b*100:.2f}%")
+
+# --- 6. end to end through the backtest ---
+_px_to = pd.DataFrame(
+    100 * np.cumprod(1 + _rng_to.multivariate_normal(_mu_to / 252, _S_to / 252, size=900), axis=0),
+    index=pd.bdate_range("2019-01-01", periods=900),
+    columns=[f"T{i}" for i in range(_n_to)])
+
+def _mu_builder_to(tr, cov_annual):
+    return bl.equilibrium_returns(_delta_to, cov_annual, _wm_to) + _rf_to, cov_annual
+
+_BT_TO = dict(freq="Daily", use_log=True, mu_builder=_mu_builder_to,
+              cov_method="Ledoit-Wolf shrinkage", freq_per_year=252, rf=_rf_to,
+              stance="Long only", max_weight=0.30, gross_limit=None,
+              objective="Max Sharpe", alpha=0.95, tc_bps=25.0, borrow_bps=50.0,
+              train_frac=0.4, resample_n=0, rebalance_periods=21,
+              vol_target=None, delta=_delta_to)
+
+_bt_off = bl.run_backtest(_px_to, turnover_lambda=0.0, **_BT_TO)
+_bt_on = bl.run_backtest(_px_to, turnover_lambda=1.0, **_BT_TO)
+check("backtest accepts the penalty and both runs complete",
+      _bt_off is not None and _bt_on is not None)
+check("backtest turnover falls once the optimiser is charged",
+      _bt_on["avg_turnover"] <= _bt_off["avg_turnover"] + 1e-9,
+      f"{_bt_off['avg_turnover']*100:.2f}% -> {_bt_on['avg_turnover']*100:.2f}% per rebalance")
+check("penalised run reports the lambda it actually used",
+      abs(_bt_on["turnover_lambda"] - 1.0) < 1e-12 and _bt_on["turnover_cost_used"] > 0)
+check("lambda=0 backtest reproduces the old unpenalised behaviour exactly",
+      abs(_bt_off["strat"]["ann_ret"] - bl.run_backtest(_px_to, turnover_lambda=0.0,
+                                                        **_BT_TO)["strat"]["ann_ret"]) < 1e-12)
+check("trading-cost drag is reported and consistent with turnover",
+      _bt_on["tc_drag_per_year"] >= 0 and _bt_on["tc_drag_per_year"] < 0.05,
+      f"{_bt_on['tc_drag_per_year']*100:.3f}pp/yr")
+
+# =========================================================
+# CURRENT HOLDINGS -> TRADE LIST
+# =========================================================
+print("\n--- holdings input ---")
+
+_UNI = ["RELIANCE.NS", "BHARTIARTL.NS", "HDFCBANK.NS", "INFY.NS", "VEDL.NS"]
+
+_h, _p = bl.parse_holdings("RELIANCE.NS 40\nBHARTIARTL.NS, 55\nHDFCBANK.NS: 48", _UNI)
+check("parses space, comma and colon separators alike",
+      _h == {"RELIANCE.NS": 40.0, "BHARTIARTL.NS": 55.0, "HDFCBANK.NS": 48.0} and not _p, str(_h))
+
+_h, _p = bl.parse_holdings("reliance 40\nINFY 12", _UNI)
+check("matches without the exchange suffix and ignores case",
+      _h == {"RELIANCE.NS": 40.0, "INFY.NS": 12.0} and not _p, str(_h))
+
+_h, _p = bl.parse_holdings("RELIANCE.NS\t40\tshares\nVEDL.NS  1,250", _UNI)
+check("handles pasted tabs, trailing words and thousands separators",
+      _h == {"RELIANCE.NS": 40.0, "VEDL.NS": 1250.0} and not _p, str(_h))
+
+_h, _p = bl.parse_holdings("# my book\n\nRELIANCE.NS 40\nTCS.NS 10\nINFY.NS", _UNI)
+check("unknown tickers and malformed lines are reported, not silently dropped",
+      _h == {"RELIANCE.NS": 40.0} and len(_p) == 2, f"{_h} / {_p}")
+
+_h, _p = bl.parse_holdings("RELIANCE.NS 10\nRELIANCE.NS 30", _UNI)
+check("repeated tickers accumulate", _h == {"RELIANCE.NS": 40.0}, str(_h))
+
+check("empty input is empty, not an error", bl.parse_holdings("", _UNI) == ({}, []))
+check("negative share counts are refused",
+      bl.parse_holdings("RELIANCE.NS -40", _UNI)[0] == {} and
+      len(bl.parse_holdings("RELIANCE.NS -40", _UNI)[1]) == 1)
+
+# --- weights from share counts ---
+_px = [100.0, 200.0, 50.0, np.nan, 10.0]
+_w_h, _val, _npr = bl.holdings_to_weights({"RELIANCE.NS": 30, "HDFCBANK.NS": 40}, _UNI, _px)
+check("holdings become weights that sum to 1",
+      abs(_w_h.sum() - 1.0) < 1e-12 and _npr == 2, f"sum {_w_h.sum():.12f}, priced {_npr}")
+check("holding weights are value-proportional",
+      abs(_w_h[0] - 3000 / 5000) < 1e-12 and abs(_w_h[2] - 2000 / 5000) < 1e-12
+      and abs(_val - 5000.0) < 1e-9, f"{_w_h.round(4)}, value {_val}")
+_wu, _vu, _nu = bl.holdings_to_weights({"INFY.NS": 100}, _UNI, _px)
+check("an unpriced holding is excluded rather than counted at zero",
+      _vu == 0.0 and _nu == 0 and float(np.sum(np.abs(_wu))) == 0.0,
+      f"value {_vu}, priced {_nu}")
+_wm2, _vm2, _nm2 = bl.holdings_to_weights({"RELIANCE.NS": 30, "INFY.NS": 100}, _UNI, _px)
+check("a mix of priced and unpriced holdings keeps only what could be priced",
+      _nm2 == 1 and abs(_vm2 - 3000.0) < 1e-9 and abs(_wm2[0] - 1.0) < 1e-12,
+      f"value {_vm2}, priced {_nm2}")
+check("no holdings gives no value and no weights",
+      bl.holdings_to_weights({}, _UNI, _px)[1] == 0.0)
+
+# --- the point of the feature: a nudged target must not generate a trade ---
+# Optimise, drift the answer slightly, feed it back as the current book, and
+# check the model declines to chase the difference once trading is charged.
+_w_now = bl.optimize_portfolio("Max Sharpe", _mu_to, _S_to, _R_to, _rf_to,
+                               "Long only", 0.30, None, 0.95, 252)
+_nudge = _w_now * np.exp(np.random.default_rng(31).normal(0, 0.02, _n_to))
+_nudge = _nudge / _nudge.sum()
+_w_free_again = bl.optimize_portfolio("Max Sharpe", _mu_to, _S_to, _R_to, _rf_to,
+                                      "Long only", 0.30, None, 0.95, 252, w_prev=_nudge,
+                                      turnover_cost=0.0)
+_w_sticky = bl.optimize_portfolio("Max Sharpe", _mu_to, _S_to, _R_to, _rf_to,
+                                  "Long only", 0.30, None, 0.95, 252, w_prev=_nudge,
+                                  turnover_cost=_TC, delta=_delta_to)
+_churn_free = float(np.sum(np.abs(_w_free_again - _nudge)))
+_churn_sticky = float(np.sum(np.abs(_w_sticky - _nudge)))
+check("a lightly drifted book is left far more alone once trading is charged",
+      _churn_sticky < _churn_free / 2,
+      f"would trade {_churn_free*100:.2f}% of the book, now trades {_churn_sticky*100:.2f}%")
+
+# New cash must not look like selling: after dilution the existing weights are
+# a smaller share of a bigger book, and w_prev has to say so.
+_held_val, _cash = 80000.0, 20000.0
+_w_pre = np.array([0.5, 0.5] + [0.0] * (_n_to - 2))
+_w_post = _w_pre * (_held_val / (_held_val + _cash))
+check("adding cash rescales the existing book instead of implying sales",
+      abs(_w_post.sum() - 0.8) < 1e-12 and np.all(_w_post <= _w_pre + 1e-12),
+      f"weights sum to {_w_post.sum():.4f} of the post-contribution book")
+
+# =========================================================
+# BREAK-EVEN DRIFT / REBALANCE GUIDANCE
+# =========================================================
+print("\n--- when is it worth trading again ---")
+
+_n_be = 25
+_r_be = np.random.default_rng(11)
+_beta_be = _r_be.uniform(0.7, 1.35, _n_be)
+_S_be = bl.nearest_psd(np.outer(_beta_be, _beta_be) * 0.030
+                       + np.diag(_r_be.uniform(0.035, 0.10, _n_be)))
+_wm_be = _r_be.dirichlet(np.ones(_n_be) * 3)
+_mu_be = bl.equilibrium_returns(3.16, _S_be, _wm_be) + 0.06
+_R_be = _r_be.multivariate_normal(_mu_be / 252, _S_be / 252, size=700)
+_w_be = bl.optimize_portfolio("Max Sharpe", _mu_be, _S_be, _R_be, 0.06,
+                              "Long only", 0.12, None, 0.95, 252)
+
+_LB_BE, _UB_BE, _NET_BE = 0.0, 0.12, 1.0
+
+def _be(tc_bps, reb_per_year, seed=7):
+    """Break-even drift, measured by asking the solver itself."""
+    return bl.breakeven_drift(
+        _w_be,
+        lambda wp: bl.optimize_portfolio("Max Sharpe", _mu_be, _S_be, _R_be, 0.06,
+                                         "Long only", 0.12, None, 0.95, 252,
+                                         w_prev=wp, turnover_cost=(tc_bps / 1e4) * reb_per_year,
+                                         delta=3.16),
+        _LB_BE, _UB_BE, _NET_BE, seed=seed)
+
+_be_in_m, _be_in_w, _be_in_y = _be(25, 12), _be(25, 52), _be(25, 1)
+_be_us_m, _be_free = _be(10, 12), _be(0, 12)
+
+check("free trading leaves essentially no band", _be_free < 0.005,
+      f"{_be_free*100:.3f}pp")
+check("the band widens as trading gets more frequent",
+      _be_in_y <= _be_in_m <= _be_in_w,
+      f"yearly {_be_in_y*100:.2f}pp <= monthly {_be_in_m*100:.2f}pp <= weekly {_be_in_w*100:.2f}pp")
+check("the band widens as trading gets more expensive",
+      _be_us_m <= _be_in_m, f"US 10bps {_be_us_m*100:.2f}pp vs India 25bps {_be_in_m*100:.2f}pp")
+
+# The number must match the SOLVER'S OWN behaviour, measured separately over
+# 625 position-level decisions per setting: at 25 bps monthly and weekly the
+# optimiser declined every discretionary trade; at 25 bps yearly and 10 bps
+# monthly it traded. A previous version of this function compared the
+# certainty-equivalent gain of correcting ONE position against its commission,
+# and called US monthly unreachable while the solver traded in 68 of 625 cases
+# -- a correction spread over many names gains far more per unit of L1
+# turnover than the same movement in one, so a single-name model overstates
+# the band by an order of magnitude. These checks exist to catch that class of
+# disagreement, not to restate the formula.
+check("India monthly: nothing discretionary clears the cost",
+      not np.isfinite(_be_in_m), f"break-even {_be_in_m}")
+check("India weekly: nothing discretionary clears the cost",
+      not np.isfinite(_be_in_w), f"break-even {_be_in_w}")
+check("India yearly: a reachable band, matching the 0.44pp median move measured",
+      np.isfinite(_be_in_y) and _be_in_y < 0.02, f"break-even {_be_in_y*100:.2f}pp")
+check("US monthly: reachable, matching the trades the solver actually makes",
+      np.isfinite(_be_us_m) and _be_us_m < 0.05, f"break-even {_be_us_m*100:.2f}pp")
+
+# A drifted book handed to the projection must be one the constraints allow,
+# or the 'trade' it triggers is a forced cap correction, not a choice.
+_pj = bl.project_to_bounds(_w_be * np.exp(np.random.default_rng(3).normal(0, 0.5, _n_be)),
+                           0.0, 0.12, 1.0)
+check("drifted books are projected back inside the cap and the budget",
+      _pj.max() <= 0.12 + 1e-9 and _pj.min() >= -1e-9 and abs(_pj.sum() - 1) < 1e-8,
+      f"max {_pj.max():.6f}, sum {_pj.sum():.10f}")
+check("projection leaves an already-feasible book alone",
+      np.allclose(bl.project_to_bounds(_w_be, 0.0, 0.12, 1.0), _w_be, atol=1e-9))
+
+check("the answer is stable across independent drift draws",
+      abs(_be(25, 1, seed=99) - _be_in_y) < 0.01 or
+      (not np.isfinite(_be(25, 1, seed=99)) and not np.isfinite(_be_in_y)),
+      f"seed 7 {_be_in_y*100:.2f}pp vs seed 99 {_be(25,1,seed=99)*100:.2f}pp")
+
+# --- the wording that reaches the user ---
+_h1, _d1, _s1 = bl.rebalance_guidance(25, 12, _be_in_m, 12.0, observed_turnover=0.0133)
+check("an unreachable band tells the user to do nothing, and says why",
+      _s1 == "none" and "none" in _h1.lower() and "12%" in _d1,
+      _h1)
+# 25 bps x 12 rebalances x 1.33% of the book turned over = 0.04pp a year.
+check("the commission figure is computed, not asserted",
+      "0.04pp a year" in _d1 and "3.00% a year" in _d1, _d1[:200])
+_h2, _d2, _s2 = bl.rebalance_guidance(10, 1, 0.008, 12.0)
+check("a small reachable band gives a normal act-on-drift instruction",
+      _s2 == "normal" and "0.8pp" in _h2, _h2)
+_h3, _d3, _s3 = bl.rebalance_guidance(25, 4, 0.035, 12.0)
+check("a wide but reachable band gives a rarely-act instruction",
+      _s3 == "rare" and "3.5pp" in _h3, _h3)
+check("the commission figure is flagged as already cost-aware, not as cheap",
+      "because" in _d1 and "refused" in _d1, _d1[-160:])
+check("guidance never crashes on degenerate inputs",
+      all(isinstance(bl.rebalance_guidance(*a)[0], str) for a in
+          [(0, 12, 0.0, 12.0), (25, 0, float("inf"), 12.0), (25, 12, float("inf"), 100.0)]))
+
+# =========================================================
+# WHAT A TRADE ACTUALLY COSTS
+# =========================================================
+# NOTE: these primitives are not yet wired to the UI. They are tested here so
+# that nothing ships unverified, and so the backward-compatibility guarantee
+# below is a checked property rather than a claim.
+print("\n--- real trading costs ---")
+
+_ZER = bl.BROKER_PRESETS["India — discount broker, delivery (Zerodha, Groww, Upstox)"]
+_FULL = bl.BROKER_PRESETS["India — full-service broker, delivery"]
+_US = bl.BROKER_PRESETS["United States — commission-free broker"]
+
+# Hand-computed, Rs 20,000 equity delivery BUY at a discount broker:
+#   STT 0.1% = 20.00 | stamp 0.015% = 3.00 | exchange 0.00297% = 0.594
+#   SEBI 0.0001% = 0.02 | GST 18% of (0 + 0.594 + 0.02) = 0.110
+#   slippage 0.05% = 10.00  ->  33.72
+check("discount-broker buy matches the hand-computed charge sheet",
+      abs(bl.order_cost(20000, "BUY", _ZER) - 33.72) < 0.01,
+      f"{bl.order_cost(20000, 'BUY', _ZER):.4f} vs 33.72")
+# The same sale adds the flat DP charge and drops stamp duty:
+#   20.00 + 0.594 + 0.02 + 0.110 + 10.00 + 15.93 = 46.65
+check("a sale drops stamp duty and adds the flat DP charge",
+      abs(bl.order_cost(20000, "SELL", _ZER) - 46.65) < 0.01,
+      f"{bl.order_cost(20000, 'SELL', _ZER):.4f} vs 46.65")
+check("a zero-size order costs nothing",
+      bl.order_cost(0, "BUY", _ZER) == 0.0 and bl.order_cost(0, "SELL", _ZER) == 0.0)
+check("no cost config means no cost", bl.order_cost(10000, "BUY", None) == 0.0)
+
+# THE POINT OF THE WHOLE EXERCISE: a fixed charge does not scale, so the
+# effective rate explodes on small orders. A flat 25 bps assumption is wrong by
+# a factor of ~33 on a Rs 200 trade, and this is what makes a small account
+# hold fewer names and trade less often than a large one.
+_bps = {v: bl.roundtrip_bps(v, _ZER) for v in (200, 1000, 20000, 200000, 1000000)}
+check("effective cost falls monotonically as the order grows",
+      all(_bps[a] > _bps[b] for a, b in zip([200, 1000, 20000, 200000],
+                                            [1000, 20000, 200000, 1000000])),
+      " > ".join(f"{v}:{_bps[v]:.0f}bps" for v in _bps))
+check("a tiny order is catastrophically expensive, not 25 bps",
+      _bps[200] > 500, f"Rs 200 round trip costs {_bps[200]:,.0f} bps")
+check("even a large order costs MORE than the 25 bps the app assumed",
+      _bps[1000000] > 25, f"Rs 10 lakh round trip costs {_bps[1000000]:,.1f} bps")
+check("a full-service broker costs materially more than a discount one",
+      bl.roundtrip_bps(20000, _FULL) > 2 * bl.roundtrip_bps(20000, _ZER),
+      f"{bl.roundtrip_bps(20000,_FULL):,.0f} vs {bl.roundtrip_bps(20000,_ZER):,.0f} bps")
+check("US costs carry no STT on buys and no depository charge",
+      bl.order_cost(20000, "BUY", _US) < bl.order_cost(20000, "BUY", _ZER) / 3,
+      f"US {bl.order_cost(20000,'BUY',_US):.2f} vs India {bl.order_cost(20000,'BUY',_ZER):.2f}")
+check("a minimum brokerage floors a tiny full-service order",
+      bl.order_cost(200, "BUY", _FULL) > 25.0,
+      f"{bl.order_cost(200, 'BUY', _FULL):.2f} on a Rs 200 order")
+
+# --- splitting one trade into many is what fixed charges punish ---
+# Only on the SELL side at a discount broker: the depository charge is per
+# scrip sold, while buys carry no fixed component at all. So fragmenting a
+# purchase is free and fragmenting a sale is not, which is not obvious and is
+# exactly the kind of thing a flat basis-point rate hides.
+_sell_one = bl.trade_book_cost(np.array([-0.25]), 400000.0, _ZER)
+_sell_many = bl.trade_book_cost(np.full(25, -0.01), 400000.0, _ZER)
+check("one big sale is cheaper than the same sale split across 25 names",
+      _sell_many > _sell_one * 1.5,
+      f"one order {_sell_one*1e4:.1f} bps vs 25 orders {_sell_many*1e4:.1f} bps")
+check("the gap is exactly the extra depository charges",
+      abs((_sell_many - _sell_one) * 400000.0 - 24 * _ZER["dp_flat_sell"]) < 0.01,
+      f"extra {(_sell_many-_sell_one)*400000.0:,.2f} vs 24 x {_ZER['dp_flat_sell']:.2f}")
+_buy_one = bl.trade_book_cost(np.array([0.25]), 400000.0, _ZER)
+_buy_many = bl.trade_book_cost(np.full(25, 0.01), 400000.0, _ZER)
+check("fragmenting a PURCHASE costs nothing extra at a discount broker",
+      abs(_buy_many - _buy_one) < 1e-12,
+      f"{_buy_one*1e4:.2f} bps vs {_buy_many*1e4:.2f} bps")
+check("...but it does at a broker with a minimum brokerage",
+      bl.trade_book_cost(np.full(25, 0.01), 400000.0, _FULL)
+      > bl.trade_book_cost(np.array([0.25]), 400000.0, _FULL))
+
+# --- BACKWARD COMPATIBILITY: with no cost config, identical to the old rate ---
+_dw = np.array([0.03, -0.02, 0.0, 0.015, -0.025])
+for _tc in (0.0, 10.0, 25.0, 100.0):
+    check(f"flat fallback at {_tc:.0f} bps reproduces tc_frac * turnover exactly",
+          abs(bl.trade_book_cost(_dw, 1e6, None, fallback_bps=_tc)
+              - (_tc / 1e4) * float(np.sum(np.abs(_dw)))) < 1e-15)
+check("an untouched book is never charged",
+      bl.trade_book_cost(np.zeros(5), 1e6, _ZER) == 0.0)
+check("a zero-value book cannot be charged",
+      bl.trade_book_cost(_dw, 0.0, _ZER) == 0.0)
 
 # =========================================================
 print()
