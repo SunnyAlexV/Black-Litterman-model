@@ -125,7 +125,7 @@ def make_builder(with_views):
 
 bt = bl.run_backtest(prices, "Daily", True, make_builder(False), "Ledoit-Wolf shrinkage",
                      freq_per_year, rf, "Long only", None, None, "Max Sharpe", 0.95,
-                     10.0, 50.0, 0.7, 0, rebalance_periods=21, rebal_label="monthly",
+                     0.7, 0, rebalance_periods=21, rebal_label="monthly",
                      caps_weights=w_mkt)
 check("backtest returns a result", bt is not None)
 if bt:
@@ -134,13 +134,13 @@ if bt:
     check("equity curve is finite and positive",
           np.all(np.isfinite(bt["strat"]["equity"])) and bt["strat"]["equity"].min() > 0)
     check("cap-weighted market benchmark was computed", bt["market"] is not None)
-    check("turnover was actually charged (weights move)", bt["avg_turnover"] > 0,
+    check("turnover is measured (weights actually move)", bt["avg_turnover"] > 0,
           f"{bt['avg_turnover']:.4f}")
     check("dates align with the equity curve", len(bt["dates"]) == len(bt["strat"]["equity"]))
 
 bt_v = bl.run_backtest(prices, "Daily", True, make_builder(True), "Ledoit-Wolf shrinkage",
                        freq_per_year, rf, "Long only", None, None, "Max Sharpe", 0.95,
-                       10.0, 50.0, 0.7, 0, rebalance_periods=21, rebal_label="monthly",
+                       0.7, 0, rebalance_periods=21, rebal_label="monthly",
                        caps_weights=w_mkt)
 check("views-on backtest differs from views-off backtest",
       bt_v is not None and abs(bt_v["strat"]["ann_ret"] - bt["strat"]["ann_ret"]) > 1e-6,
