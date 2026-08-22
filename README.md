@@ -93,6 +93,52 @@ both (global multi-asset ETFs)       pi differs by 2.36pp    <- daily is wrong
 
 So the frequency is chosen by the universe: **daily for a single-exchange universe** (all NSE, all NYSE), **weekly for one spanning time zones**. Every horizon within a universe still sees identical data — what varies is what is being held, not how often it is traded. The rebalance period is rescaled with the frequency so that rebalances-per-year is preserved.
 
+### The holding period reaches the model
+
+Selecting Weekly instead of Yearly used to change exactly two things: how often the backtest rebalanced, and the window over which view engines measured their hit rate. It never touched the covariance or the optimiser, so **both horizons handed you the identical portfolio.**
+
+The reason a holding period *should* matter is that scaling daily variance by the number of days assumes each day is independent of the last. Real assets are not. The variance ratio measures it directly:
+
+```
+VR(h) = Var(h-period return) / (h x Var(1-period return))
+```
+
+VR below 1 means the asset settles down over a long hold — genuinely less risky than daily volatility implies, so it can be held bigger. Above 1 means it drifts further away, and should be held smaller. Under strict i.i.d. returns VR = 1 at every horizon and the holding period really does not matter, which is a useful null: on an i.i.d. panel the measured ratios come back within 0.25 of 1.
+
+Overlapping windows are far noisier than the raw sample suggests — 3,780 daily observations hold only ~15 independent annual ones — so VR is shrunk toward 1 by the *effective* count. A weekly horizon is left essentially untouched; a yearly one is pulled most of the way back unless the evidence is strong. Only volatilities are rescaled; correlations are kept from daily data, where they are estimated well rather than from a handful of annual windows. The loss-based objectives are additionally handed holding-period returns, because the 5% worst *day* and the 5% worst *year* are different questions.
+
+On a panel built with half the names mean-reverting and half trending, the measurement separates them cleanly (VR 0.86 vs 1.62 at a one-year hold). What it does to the portfolio depends entirely on the objective:
+
+```
+                 views OFF   views ON
+Max Sharpe            0.4%      11.2%
+Min variance         42.0%      42.0%
+Min CVaR             63.2%      63.2%
+Max Sortino          65.5%      64.8%
+```
+
+**Max Sharpe with no views cannot respond to the holding period, and that is a theorem rather than a defect.** π = δΣw is reverse-optimised *from* the market weights, so optimising it forward returns those weights for any Σ whatsoever. Rescaling risk for a longer hold rescales the prior identically and cancels. The app says so on screen, and points at the two things that do work: add a view, or choose a risk-based objective.
+
+This is the same property that makes Black-Litterman robust in the first place — with no opinion you get the market — so it is not something to engineer around.
+
+### One holding period, not one eight-year path
+
+The headline backtest answers *"what if I ran this for eight years?"* — one compounded number. Most people are asking something narrower: *"if I buy this today and hold it for a week, what happens?"* Those are different questions, and reporting only the first invites the second to be read off it. A +178% eight-year figure gets mistaken for a single-period outcome, which is the most dangerous misreading the app can produce.
+
+The walk-forward loop has already run the narrow experiment hundreds of times. Every segment between two rebalances buys the portfolio the model recommended using only data available then, holds it untouched for exactly one horizon, and records the result. So the backtest now reports both, with the single-period answer **first**:
+
+- how many complete holds the window contains (407 weekly, 97 monthly, 9 yearly)
+- the typical one-period return, in rupees on your actual capital
+- what share of holds ended in profit
+- best, worst, and the 5–95% band
+- how often it beat the index over exactly the same days
+
+A test pins the two together: chaining every individual hold must reproduce the compounded equity curve to machine precision. If it did not, the two numbers on screen would be describing different strategies.
+
+At the yearly horizon only nine holds fit in the window, so they are listed individually rather than dressed up as a distribution. Nine samples is not a distribution and the app says so.
+
+**The horizon dropdown was also mislabelled.** "How long will you hold?" reads as "how long am I investing for". It never meant that — it sets how long each portfolio is held before being re-checked. The caption now says so directly.
+
 ### "Per year" means a year on the calendar
 
 Annualising 2,035 daily observations by a nominal 252 trading days treats them as 8.075 years. India actually trades about 247 days a year, so those observations really span **8.225** years — and the shorter time base inflated every annualised figure by roughly a quarter of a point:
@@ -243,7 +289,7 @@ On Windows, if `streamlit` isn't on your PATH, use `python -m streamlit run blac
 python test_bl_core.py
 ```
 
-143 headless checks covering the numeric core, with Streamlit and yfinance stubbed so nothing needs a server or a network connection. They check reverse optimisation round-trips, that the two posterior formulas agree, Ω construction under both methods, view parsing and excess-return conversion, τ invariance, confidence linearity, the volatility overlay's no-look-ahead property, the negative-Sharpe artifact, the share allocator (never overspends, respects board lots, strands less than one lot), the relative volatility target, the systematic view engines — both proven free of look-ahead by divergent-futures tests — the adaptive history window, that the vectorised Ledoit-Wolf estimator matches the textbook loop to machine precision, and the holdings parser (separators, missing suffixes, thousands separators, unknown tickers reported rather than dropped).
+183 headless checks covering the numeric core, with Streamlit and yfinance stubbed so nothing needs a server or a network connection. They check reverse optimisation round-trips, that the two posterior formulas agree, Ω construction under both methods, view parsing and excess-return conversion, τ invariance, confidence linearity, the volatility overlay's no-look-ahead property, the negative-Sharpe artifact, the share allocator (never overspends, respects board lots, strands less than one lot), the relative volatility target, the systematic view engines — both proven free of look-ahead by divergent-futures tests — the adaptive history window, that the vectorised Ledoit-Wolf estimator matches the textbook loop to machine precision, and the holdings parser (separators, missing suffixes, thousands separators, unknown tickers reported rather than dropped).
 
 Two properties worth knowing about, both locked down by tests:
 
