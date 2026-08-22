@@ -18,6 +18,12 @@ Mean-variance optimisation has a well-known failure mode: it is exquisitely sens
 
 You can see this working in the app: the **Markowitz wt %** column sits next to the BL weights, and on live data it typically shows the classic corner solution — everything pinned at the weight cap or at zero — while Black-Litterman produces a graded portfolio from the same covariance matrix and the same constraints.
 
+## What this app does, and what it deliberately leaves out
+
+It answers one question: **given the market's own portfolio and whatever views you hold, how should the money be allocated?**
+
+It does not model what allocating it would cost. There is no brokerage, no STT or stamp duty, no slippage, no market impact, no tax, and no borrowing charge on shorts anywhere in the code. Every number is gross. That is a scope choice, not an oversight — costs are broker-specific and vary with account size, venue and order size, and folding them in turned the app into a discussion about execution rather than allocation. Subtract your own costs from whatever it shows you, and remember they scale with trading frequency.
+
 ## Features
 
 ### The model
@@ -70,7 +76,7 @@ HIGH-VOL book (natural 10.9%)
 
 The relative target is recomputed at each rebalance **from the training window only** — computing it from full-sample volatility would be look-ahead bias. A regression test proves it: two price series with identical history and different futures produce bit-identical exposures before the divergence point.
 
-The backtest runs the strategy both ways and plots both, so you can see what the overlay cost or earned rather than taking it on faith.
+The backtest runs the strategy both ways and plots both, so you can see what the overlay gave up or earned rather than taking it on faith.
 
 ### Return frequency follows the assets, not the holding period
 
@@ -104,73 +110,15 @@ yearly           9     23.8%   11.86%   252,139   -2.7%
 
 The benchmark lines were fixed the same way: a cap-weighted market portfolio described as "buy & hold" now actually is one.
 
-### The optimiser pays for its own trading
-
-Once holdings drift, the optimiser faces a real choice at each rebalance — and until recently it made that choice blind. It picked weights in a vacuum and the backtest charged the execution bill afterwards, so it would propose a trade whose expected benefit was smaller than its own commission and never notice.
-
-Each rebalance is now solved **net of what the trade costs to execute**:
-
-```
-maximise    w'μ  −  λ·c·Σ|wᵢ − wᵢ_prev|   ...then the usual risk term
-```
-
-where `w_prev` is the *drifted* book, `c` the market's cost in bps, and `λ` a multiplier (1.0 = charge the true cost). All four objectives take it, each in its own units: the drag comes off the numerator for Sharpe and Sortino, is added to CVaR per period, and is converted through δ for min-variance.
-
-The economics are why this is close to free. A mean-variance objective is **flat at its maximum**, so moving off the optimum costs utility at second order while saving cost at first order. Near the top the saving always wins, and there is guaranteed to be a smaller trade that leaves you better off net.
-
-Measured across 14 paired backtests on independent synthetic panels (25 assets, true expected returns rotating every two years, monthly rebalancing, 25 bps):
-
-| | mean | sd | interpretation |
-|---|---|---|---|
-| Turnover | **−76.2%** | 4.0 | reliable |
-| Trading-cost drag | **−0.155pp/yr** | 0.010 | near-deterministic |
-| Annual return | **+0.816pp/yr** | 0.925 | t = 3.30, positive in 13/14 |
-
-The return gain is larger than the cost saved, so most of it is not cost at all — it is estimation noise not being traded on. But the single-path range is **−0.69pp to +2.45pp**, so no individual backtest demonstrates any of this. Judge the feature on the turnover and cost columns, which are reliable, and treat the return column as an expectation across many paths rather than a promise about yours.
-
-Two implementation notes, both of which cost a wrong answer before they were found:
-
-**The exact formulation is the fast one.** `Σ|w − w_prev|` is not differentiable exactly where no-trade solutions live, so the obvious dodge is to smooth it: `√(d² + ε²)`. Measured on a 25-asset book, the smoothed version runs at 0.42–1.5s per solve against **0.018s** for the exact buy/sell split (`w − w_prev − b + s = 0`, `b,s ≥ 0`). Smoothing puts curvature of order 1/ε right where the solution sits and destroys SLSQP's Hessian approximation; conditioning dominates dimension. The 2n extra variables are not the expensive part.
-
-**Never rank candidates on the auxiliary variables.** SLSQP satisfies the split equality only to tolerance, and the objective rewards a small `b + s` — so slack in that constraint is a licence to price a trade below what it really costs, and the solver takes it. Candidates are scored by recomputing `|w − w_prev|` from the weights alone. Two fallbacks (hold still, trade the whole way) plus the best partial rebalance on the line between them are supplied before the solver runs, so its answer can only ever improve on them.
-
-One behaviour that looks like a bug and is not: **the position cap outranks the penalty.** Drift routinely pushes a holding past the max-weight limit, and when it does, "hold still" is not on the menu at any price — the book gets traded back into compliance however expensive trading has been made. A test forces this with λ = 500.
-
-### When is it worth trading at all?
-
-The most useful thing this model can tell a retail investor turned out to be *don't*.
-
-Measured by asking the cost-aware optimiser directly — drift the optimal book, project it back inside the constraints so nothing is a forced trade, and see what it chooses — across 625 position-level decisions per setting:
-
-```
-                                    trades    turnover   median move acted on
-India 25bps, monthly / drift only     0/625      0.00%          —
-India 25bps, monthly / big shift      0/625      0.00%          —
-India 25bps, weekly  / big shift      0/625      0.00%          —
-India 25bps, yearly  / drift only    95/625      1.13%       0.44pp
-India 25bps, yearly  / big shift    220/625     16.80%       2.33pp
-US    10bps, monthly / big shift     68/625      3.27%       3.61pp
-```
-
-**At Indian retail costs on a weekly or monthly schedule, the cost-aware answer is to trade nothing.** Not less — nothing. Trading monthly means paying 25 bps twelve times a year, which charges 3.00% annually for every 100% of the book turned over, and a near-index portfolio never improves enough to clear that. Only the yearly horizon generates discretionary trades in India. At US costs monthly becomes viable, but only for moves above roughly 1pp.
-
-The app computes this per run and says so in plain language, from the user's own market cost, chosen frequency, position cap and Σ — not from a hardcoded rule, because the answer differs by an order of magnitude between 25 bps weekly and 10 bps yearly.
-
-**The band is measured, not modelled.** The first version compared the certainty-equivalent gain of correcting one position against its commission — tidy, and wrong. It declared US monthly unreachable while the solver on identical inputs traded in 68 of 625 decisions. A correction spread across many names gains far more per unit of L1 turnover than the same movement concentrated in one, so a single-name formula overstates the band by an order of magnitude. Asking the solver costs under a second and cannot disagree with the thing it describes.
-
-A caveat that limits the finding: the drift simulation holds true expected returns fixed within each case, so it cannot reward genuinely new information. Real markets deliver some. But the momentum engine earns 4% confidence on this data — not much new information is arriving, which is the same conclusion reached from the other direction.
-
 ### Telling it what you already own
 
-A backtest knows what it held a month ago. The live screen did not — it treated every visit as a fresh start from cash, handed you a shopping list, and could not charge for turnover because as far as it knew every position was a first purchase.
-
-So the app measured a strategy that trades rarely and displayed one that rebuilds from zero on every run. Open it in September, buy the list; open it in October, see RELIANCE move 12.0% → 11.4%, and trade the difference — a trade the backtest itself would have declined, because 0.6pp of weight does not repay STT plus stamp plus brokerage.
+A backtest knows what it held a month ago. The live screen did not — it treated every visit as a fresh start from cash and handed you a shopping list, so comparing two runs by eye was the only way to work out what had actually changed.
 
 Paste what you hold and the **What to buy** tab becomes **What to trade**:
 
 | Stock | You own | Target | Action |
 |---|---|---|---|
-| RELIANCE.NS | 12.0% | 11.4% | **Hold** — not worth the cost |
+| RELIANCE.NS | 12.0% | 11.4% | Buy 3 shares |
 | INFY.NS | 0% | 4.2% | **Buy 22 shares** |
 | VEDL.NS | 3.1% | 0% | **Sell all 84 shares** |
 
@@ -178,13 +126,9 @@ The parser takes whatever people actually paste — `RELIANCE.NS 40`, `RELIANCE,
 
 Two details that are easy to get wrong:
 
-**New cash is not a sale.** Adding capital dilutes every existing weight, so `w_prev` is restated as a share of the post-contribution book. Skip that and the model sees phantom selling in every line and charges you commission for it.
+**New cash is not a sale.** Adding capital dilutes every existing weight, so the previous book is restated as a share of the post-contribution total. Skip that and the model sees phantom selling in every line.
 
 **A trade smaller than one lot is a hold.** Printing "buy 0.4 shares" is not an instruction, so anything under a lot is reported as HOLD rather than as a fractional target nobody can execute.
-
-The honest limit: none of this improves the forecasts. It makes what the app tells you to do consistent with what the backtest measured — which it previously was not.
-
-This also explains why the three horizons finish so close together. Rebalance frequency was always a second-order lever — the objective is flat at the top, so trading more often buys very little gross — and charging for turnover compresses them further by removing exactly the marginal trades that made the fast horizon expensive.
 
 ### Results on real data
 
@@ -247,7 +191,7 @@ Both are now decoupled. Every horizon estimates from the same 15-year daily hist
 | Monthly — medium-term | up to 15 years | daily | ~12/year | ~3,780 |
 | Yearly — long-term | up to 15 years | daily | ~1/year | ~3,780 |
 
-Neither setting is the "good" one. More rebalances give more decisions to judge the strategy on and cost more in turnover; fewer give a cleaner read on the long-run allocation from a smaller sample of decisions. The app says exactly that and does not steer.
+Neither setting is the "good" one. More rebalances give more decisions to judge the strategy on; fewer give a cleaner read on the long-run allocation from a smaller sample of decisions. No trading costs are modelled, so the app makes no claim about which frequency is cheaper. The app says exactly that and does not steer.
 
 **The window is chosen from the data, not imposed.** Demanding a fixed 15 years would silently discard every asset younger than that — half a Nifty universe in practice — while a naive `dropna()` would truncate *every* asset to the youngest one's history. Instead the app walks the window down from 15 years and stops at the longest length that still supports a full-sized universe, backfilling excluded names from the next most liquid long-lived candidates. A universe where nothing is old shortens the window gracefully rather than failing.
 
@@ -261,7 +205,7 @@ Where the app compares things, it states both sides of the trade rather than dec
 
 ### Per-market recommended settings
 
-Choosing a market applies sensible defaults automatically — local risk-free rate and realistic all-in trading costs (India carries STT and stamp duty; the UK and Hong Kong carry stamp; the US does not). Alongside: 12% single-stock cap, δ implied, Ω Idzorek, 75% view confidence, a volatility target at 75% of the portfolio's own risk, and a 0.45 backtest training fraction.
+Choosing a market applies sensible defaults automatically — the local risk-free rate, which is the opportunity cost the equilibrium prior is measured against. Alongside: 12% single-stock cap, δ implied, Ω Idzorek, 75% view confidence, a volatility target at 75% of the portfolio's own risk, and a 0.45 backtest training fraction.
 
 The risk-free rates are August 2026 government bill yields, hardcoded in `MARKET_DEFAULTS` at the top of the file. They will drift — update them there.
 
@@ -282,7 +226,7 @@ On Windows, if `streamlit` isn't on your PATH, use `python -m streamlit run blac
 python test_bl_core.py
 ```
 
-196 headless checks covering the numeric core, with Streamlit and yfinance stubbed so nothing needs a server or a network connection. They check reverse optimisation round-trips, that the two posterior formulas agree, Ω construction under both methods, view parsing and excess-return conversion, τ invariance, confidence linearity, the volatility overlay's no-look-ahead property, the negative-Sharpe artifact, the share allocator (never overspends, respects board lots, strands less than one lot), the relative volatility target, the systematic view engines — both proven free of look-ahead by divergent-futures tests — the adaptive history window, that the vectorised Ledoit-Wolf estimator matches the textbook loop to machine precision, and the turnover penalty — that it never returns a portfolio worse than holding still or than trading the whole way, that it beats the best partial rebalance, that turnover falls monotonically as the charge rises, that all four objectives accept it, that the position cap still binds when trading is made prohibitively expensive, and the holdings parser (separators, missing suffixes, thousands separators, unknown tickers reported rather than dropped), the real cost model (per-order charges checked against a hand-computed broker charge sheet, and the flat-rate fallback proven bit-identical to the old behaviour), and the break-even band — that it widens with cost and frequency, that it agrees with the solver's own behaviour, and that drifted books are projected back inside the constraints so a forced cap correction is never miscounted as a worthwhile trade.
+133 headless checks covering the numeric core, with Streamlit and yfinance stubbed so nothing needs a server or a network connection. They check reverse optimisation round-trips, that the two posterior formulas agree, Ω construction under both methods, view parsing and excess-return conversion, τ invariance, confidence linearity, the volatility overlay's no-look-ahead property, the negative-Sharpe artifact, the share allocator (never overspends, respects board lots, strands less than one lot), the relative volatility target, the systematic view engines — both proven free of look-ahead by divergent-futures tests — the adaptive history window, that the vectorised Ledoit-Wolf estimator matches the textbook loop to machine precision, and the holdings parser (separators, missing suffixes, thousands separators, unknown tickers reported rather than dropped).
 
 Two properties worth knowing about, both locked down by tests:
 
@@ -315,7 +259,7 @@ Read these before drawing conclusions, and certainly before allocating real mone
 - **Survivorship bias.** Optimises over each index's *current* constituents, so delisted and demoted companies never appear. This systematically overstates historical returns.
 - **The backtest is a single path.** One market, one sequence of history, a handful of rebalances. It cannot separate skill from luck.
 - **Views are opinions.** The model faithfully amplifies them in proportion to your stated confidence. Confident and wrong is the expensive quadrant.
-- Costs are modelled as flat basis points on turnover. No market impact, no slippage, no taxes.
+- **No costs of any kind are modelled** — no brokerage, no STT or stamp duty, no slippage, no market impact, no taxes, no borrowing charge on shorts. Every figure is gross. This is deliberate: the app answers *how should the money be allocated*, not *what will my broker charge*. Your own costs come off the top, and they scale with how often you trade, so the higher-frequency horizons are the most flattered by their absence.
 
 Closing this gap is mostly a data problem, not a coding one: point-in-time index membership, vendor market caps, and rolling-window backtests across many start dates.
 
