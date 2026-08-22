@@ -93,6 +93,23 @@ both (global multi-asset ETFs)       pi differs by 2.36pp    <- daily is wrong
 
 So the frequency is chosen by the universe: **daily for a single-exchange universe** (all NSE, all NYSE), **weekly for one spanning time zones**. Every horizon within a universe still sees identical data — what varies is what is being held, not how often it is traded. The rebalance period is rescaled with the frequency so that rebalances-per-year is preserved.
 
+### "Per year" means a year on the calendar
+
+Annualising 2,035 daily observations by a nominal 252 trading days treats them as 8.075 years. India actually trades about 247 days a year, so those observations really span **8.225** years — and the shorter time base inflated every annualised figure by roughly a quarter of a point:
+
+```
+                 nominal (n/252)   calendar-correct
+strategy              13.52%            13.26%
+Nifty 50              10.74%            10.53%
+volatility             13.0%             12.9%
+```
+
+Small, but it was a free overstatement in the app's favour, and "13.5% a year" has to mean a year on the calendar if anyone is going to weigh it against a deposit rate. Realised performance now derives its period count from the first and last dates of the test window. Total growth is unchanged — only the time base moved.
+
+The correction does not always run downward. A synthetic business-day series with no holidays implies ~260 periods a year, and the same fix raises its annualised figure instead. A test pins both directions.
+
+**The chart axis had the mirror-image problem.** Matplotlib's default 5% margin padded about five months of blank space onto each end, so a chart of data ending 2026-08-20 rendered an axis running to 2027 — and the trailing gap read as the strategy going flat. The limits are now pinned to the first and last observation.
+
 ### Holdings drift between rebalances
 
 A subtle but consequential detail. The obvious way to compute a held portfolio's return is `R @ w` — apply the target weights to each period's returns. That is wrong for anything other than a continuously rebalanced book: it silently resets the portfolio to `w` every single period, so a "yearly rebalanced" strategy computed that way is really a daily-rebalanced one that happens to re-optimise annually.
@@ -226,7 +243,7 @@ On Windows, if `streamlit` isn't on your PATH, use `python -m streamlit run blac
 python test_bl_core.py
 ```
 
-133 headless checks covering the numeric core, with Streamlit and yfinance stubbed so nothing needs a server or a network connection. They check reverse optimisation round-trips, that the two posterior formulas agree, Ω construction under both methods, view parsing and excess-return conversion, τ invariance, confidence linearity, the volatility overlay's no-look-ahead property, the negative-Sharpe artifact, the share allocator (never overspends, respects board lots, strands less than one lot), the relative volatility target, the systematic view engines — both proven free of look-ahead by divergent-futures tests — the adaptive history window, that the vectorised Ledoit-Wolf estimator matches the textbook loop to machine precision, and the holdings parser (separators, missing suffixes, thousands separators, unknown tickers reported rather than dropped).
+143 headless checks covering the numeric core, with Streamlit and yfinance stubbed so nothing needs a server or a network connection. They check reverse optimisation round-trips, that the two posterior formulas agree, Ω construction under both methods, view parsing and excess-return conversion, τ invariance, confidence linearity, the volatility overlay's no-look-ahead property, the negative-Sharpe artifact, the share allocator (never overspends, respects board lots, strands less than one lot), the relative volatility target, the systematic view engines — both proven free of look-ahead by divergent-futures tests — the adaptive history window, that the vectorised Ledoit-Wolf estimator matches the textbook loop to machine precision, and the holdings parser (separators, missing suffixes, thousands separators, unknown tickers reported rather than dropped).
 
 Two properties worth knowing about, both locked down by tests:
 
