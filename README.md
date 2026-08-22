@@ -1,16 +1,36 @@
 # Black-Litterman Portfolio Model
 
-📊 **Black-Litterman Portfolio Optimizer** — start from the market, tilt with your views.
+[![tests](https://github.com/SunnyAlexV/Black-Litterman-model/actions/workflows/tests.yml/badge.svg)](https://github.com/SunnyAlexV/Black-Litterman-model/actions/workflows/tests.yml)
+[![live app](https://img.shields.io/badge/live%20app-streamlit-FF4B4B?logo=streamlit&logoColor=white)](https://black-litterman-model.streamlit.app/)
+[![python](https://img.shields.io/badge/python-3.11-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![licence](https://img.shields.io/badge/licence-MIT-black)](LICENSE)
 
-An interactive Streamlit app that builds a portfolio the way institutional allocators actually do it: instead of asking you to forecast every return (which Markowitz does, and then amplifies whatever you got wrong), it starts from the portfolio the market is already holding, reverse-engineers the returns that would make that portfolio optimal, and moves away from it only as far as your own views — and your confidence in them — justify.
+**Start from the portfolio the market is already holding, then tilt it only as far as your views — and your confidence in them — justify.**
 
-## 🔗 Live demo
+### ▶ [Try it live](https://black-litterman-model.streamlit.app/)
 
-https://black-litterman-model.streamlit.app/
+![Out-of-sample backtest](docs/backtest.png)
 
-On Streamlit's free tier the app sleeps after inactivity and wakes on your first visit (give it ~30 seconds to spin up).
+*Out-of-sample walk-forward test: the model against its own equilibrium prior, an equal-weight basket, and the index. Every line is re-derived at each rebalance from data available at that point only.*
 
-Companion to the [Markowitz Optimum Portfolio Model](https://github.com/SunnyAlexV/Markowitz-Optimum-Portfolio-model). Same markets, same execution output, same backtest engine — a different, and considerably more robust, way of getting to expected returns.
+---
+
+## What makes this different from the other portfolio optimisers on GitHub
+
+- **183 headless tests**, including a regression test that feeds the volatility overlay two price series with **identical pasts and different futures** and proves its exposures are bit-identical before the divergence — the look-ahead failure that invalidates most backtests, caught by construction rather than by assertion.
+- **The implementation is validated, not just written.** With no views the posterior must reproduce its prior. Across four universes with δ from 2.04 to 4.69, the gap never exceeds **0.67pp**. On the ETF universe, where no constraint binds, the BL weights match the market weights to two decimals.
+- **View confidence is earned, not typed.** Each rule's realised hit rate is measured walking forward, then converted to a confidence. Momentum scored 51–53% — chance — so it was assigned **2–4% confidence** and moved the portfolio almost nowhere. The app reports that views added nothing rather than hiding it.
+- **Three of its own bugs are documented in this README**, including one that made every rebalance frequency return the same answer, and a finding that a feature built here **cannot work** under the default objective.
+- **ETF universes are included specifically because the stock universes carry survivorship bias** — and the README says which numbers you may believe and which you may not.
+- **No trading costs, taxes or borrowing charges are modelled anywhere.** Every figure is gross, and the app says so on screen. Deliberate scope, stated rather than buried.
+
+```bash
+git clone https://github.com/SunnyAlexV/Black-Litterman-model
+cd Black-Litterman-model
+pip install -r requirements.txt
+python test_bl_core.py            # 183 checks, no network needed
+python -m streamlit run black_litterman_portfolio.py
+```
 
 ## The idea in one paragraph
 
