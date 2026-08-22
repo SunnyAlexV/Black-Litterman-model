@@ -72,6 +72,21 @@ The relative target is recomputed at each rebalance **from the training window o
 
 The backtest runs the strategy both ways and plots both, so you can see what the overlay cost or earned rather than taking it on faith.
 
+### Return frequency follows the assets, not the holding period
+
+A common recommendation is to estimate Σ from weekly returns when rebalancing weekly, because scaling daily figures misstates covariance. Half right — but the reason has nothing to do with how often you trade.
+
+Daily data gives five times more observations, which is what Σ wants. It also breaks when assets trade in **different sessions**: SPY closes at 21:00 IST, EFA at 16:30 CET, EEM straddles both, so a day's "simultaneous" returns are not simultaneous and daily correlations come out understated (the Epps effect). Measured on simulated panels, comparing daily-annualised against weekly-annualised Σ:
+
+```
+synchronous, no autocorrelation      pi differs by 0.38pp    <- daily is fine
+synchronous, AR(1) = 0.10            pi differs by 1.30pp
+NON-synchronous sessions             pi differs by 1.61pp
+both (global multi-asset ETFs)       pi differs by 2.36pp    <- daily is wrong
+```
+
+So the frequency is chosen by the universe: **daily for a single-exchange universe** (all NSE, all NYSE), **weekly for one spanning time zones**. Every horizon within a universe still sees identical data — what varies is what is being held, not how often it is traded. The rebalance period is rescaled with the frequency so that rebalances-per-year is preserved.
+
 ### Holdings drift between rebalances
 
 A subtle but consequential detail. The obvious way to compute a held portfolio's return is `R @ w` — apply the target weights to each period's returns. That is wrong for anything other than a continuously rebalanced book: it silently resets the portfolio to `w` every single period, so a "yearly rebalanced" strategy computed that way is really a daily-rebalanced one that happens to re-optimise annually.
@@ -185,7 +200,7 @@ On Windows, if `streamlit` isn't on your PATH, use `python -m streamlit run blac
 python test_bl_core.py
 ```
 
-113 headless checks covering the numeric core, with Streamlit and yfinance stubbed so nothing needs a server or a network connection. They check reverse optimisation round-trips, that the two posterior formulas agree, Ω construction under both methods, view parsing and excess-return conversion, τ invariance, confidence linearity, the volatility overlay's no-look-ahead property, the negative-Sharpe artifact, the share allocator (never overspends, respects board lots, strands less than one lot), the relative volatility target, the systematic view engines — both proven free of look-ahead by divergent-futures tests — the adaptive history window, and that the vectorised Ledoit-Wolf estimator matches the textbook loop to machine precision.
+121 headless checks covering the numeric core, with Streamlit and yfinance stubbed so nothing needs a server or a network connection. They check reverse optimisation round-trips, that the two posterior formulas agree, Ω construction under both methods, view parsing and excess-return conversion, τ invariance, confidence linearity, the volatility overlay's no-look-ahead property, the negative-Sharpe artifact, the share allocator (never overspends, respects board lots, strands less than one lot), the relative volatility target, the systematic view engines — both proven free of look-ahead by divergent-futures tests — the adaptive history window, and that the vectorised Ledoit-Wolf estimator matches the textbook loop to machine precision.
 
 Two properties worth knowing about, both locked down by tests:
 
