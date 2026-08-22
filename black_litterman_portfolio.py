@@ -740,6 +740,74 @@ def _ewma_weights(t, halflife):
     return w / w.sum()
 
 
+def horizon_returns(returns, h):
+    """Overlapping h-period compounded returns from a period-return panel.
+
+    Row k is the return between the price at k and the price at k + h, i.e. it
+    compounds periods k+1 through k+h. The output therefore has len(R) - h rows,
+    one per window that fully fits inside the sample.
+    """
+    R = np.asarray(returns, dtype=float)
+    h = max(1, int(h))
+    if h == 1 or len(R) <= h:
+        return R
+    g = np.cumprod(1.0 + R, axis=0)
+    return g[h:] / g[:-h] - 1.0
+
+
+def variance_ratio(returns, h, shrink_c=10.0, lo=0.25, hi=4.0):
+    """Per-asset variance ratio VR(h) = Var(h-period) / (h x Var(1-period)).
+
+    The whole reason a holding period should change a portfolio. Scaling daily
+    variance by h assumes returns are independent from one day to the next. They
+    are not: an asset that mean-reverts is LESS risky over a year than its daily
+    volatility implies (VR < 1) and deserves more weight in a long hold, while a
+    trending one is MORE risky (VR > 1) and deserves less. Under strict i.i.d.
+    returns VR = 1 at every horizon and the holding period genuinely does not
+    matter -- which is why the app used to give the same answer for a week and a
+    year.
+
+    Overlapping windows mean the estimate is far noisier than the raw sample
+    size suggests: 3,780 daily observations contain only ~15 independent annual
+    ones. So VR is shrunk toward 1 by the effective sample count, which leaves a
+    weekly horizon essentially untouched and pulls a yearly one most of the way
+    back unless the evidence is strong. Clipped to [lo, hi] so a single freak
+    window cannot rescale a book.
+    """
+    R = np.asarray(returns, dtype=float)
+    h = max(1, int(h))
+    if R.ndim == 1:
+        R = R[:, None]
+    n = R.shape[1]
+    if h == 1 or len(R) <= 2 * h:
+        return np.ones(n)
+    var1 = np.var(R, axis=0, ddof=1)
+    Rh = horizon_returns(R, h)
+    if len(Rh) < 3:
+        return np.ones(n)
+    varh = np.var(Rh, axis=0, ddof=1)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        vr = np.where(var1 > 1e-18, varh / (h * var1), 1.0)
+    vr = np.where(np.isfinite(vr), vr, 1.0)
+    # Effective independent observations at this horizon, not the overlapping count.
+    n_eff = len(R) / float(h)
+    k = n_eff / (n_eff + float(shrink_c))
+    vr = 1.0 + (vr - 1.0) * k
+    return np.clip(vr, lo, hi)
+
+
+def apply_variance_ratio(cov_annual, vr):
+    """Rescale each asset's variance by its variance ratio, keeping correlations.
+
+    Correlations are estimated well from daily data and badly from a handful of
+    overlapping annual windows, so only the volatilities are re-scaled here.
+    That is a deliberate compromise and the reason it is stated in the app.
+    """
+    S = np.asarray(cov_annual, dtype=float)
+    d = np.sqrt(np.clip(np.asarray(vr, dtype=float), 1e-12, None))
+    return nearest_psd(S * np.outer(d, d))
+
+
 def estimate_cov(returns, method, freq_per_year):
     R = returns.values
     t = R.shape[0]
@@ -1439,19 +1507,26 @@ def _solve(obj_fun, n, lb, ub, net, gross, seed_w=None, extra_starts=None):
 
 
 def _optimize_once(objective, mu, cov, R, rf, stance, cap, gross, alpha, freq_per_year,
-                   delta=None):
-    """Solve for the optimal weights under the chosen objective and constraints."""
+                   delta=None, R_ppy=None):
+    """Solve for the optimal weights under the chosen objective and constraints.
+
+    `R_ppy` is how many observations of `R` there are in a year. It exists so
+    the loss-based objectives can be handed HOLDING-PERIOD returns rather than
+    daily ones: the 5% worst day and the 5% worst year are different questions,
+    and a portfolio held for a year should be judged on the second.
+    """
     mu = np.asarray(mu, dtype=float)
     cov = np.asarray(cov, dtype=float)
     n = len(mu)
     lb, ub, net = _stance_bounds(stance, cap, n)
-    target_period = rf / freq_per_year
+    ppy = float(R_ppy) if (R_ppy and R_ppy > 0) else float(freq_per_year)
+    target_period = rf / ppy
 
     if objective == "Min variance":
         obj = lambda w: float(w @ cov @ w)
     elif objective == "Max Sortino":
         obj = lambda w: -((w @ mu) - rf) / max(
-            _downside_dev(w, R, target_period, freq_per_year), 1e-9)
+            _downside_dev(w, R, target_period, ppy), 1e-9)
     elif objective == "Min CVaR":
         obj = lambda w: _cvar(w, R, alpha)
     else:  # Max Sharpe
@@ -1496,14 +1571,15 @@ def resample_stack(objective, mu, cov, rf, stance, max_weight, gross_limit,
 
 
 def optimize_portfolio(objective, mu, cov, R, rf, stance, max_weight, gross_limit,
-                       alpha, freq_per_year, resample_n=0, seed=7, delta=None):
+                       alpha, freq_per_year, resample_n=0, seed=7, delta=None,
+                       R_ppy=None):
     cap = max_weight if max_weight is not None else 1.0
     if resample_n and resample_n > 0:
         return resample_stack(objective, mu, cov, rf, stance, max_weight, gross_limit,
                               alpha, freq_per_year, resample_n, seed,
                               delta=delta).mean(axis=0)
     return _optimize_once(objective, mu, cov, R, rf, stance, cap, gross_limit, alpha,
-                          freq_per_year, delta=delta)
+                          freq_per_year, delta=delta, R_ppy=R_ppy)
 
 
 def _min_var_at_target(mu, cov, lb, ub, net, gross, target):
@@ -1676,7 +1752,8 @@ def run_backtest(prices, freq, use_log, mu_builder, cov_method, freq_per_year, r
                  bench_prices=None, fx_prices=None, bench_label="Index",
                  caps_weights=None,
                  vol_target=None, vol_lookback=None, vol_max_leverage=1.0,
-                 vol_target_frac=None, delta=None, capital=None):
+                 vol_target_frac=None, delta=None, capital=None,
+                 horizon_aware=True):
     """Walk-forward backtest: starting after an initial training window, re-build
     the expected returns every `rebalance_periods` periods using all data up to
     that point (expanding window) and hold those weights until the next
@@ -1691,6 +1768,8 @@ def run_backtest(prices, freq, use_log, mu_builder, cov_method, freq_per_year, r
     rebalance from data available at that time — which is what keeps the test
     genuinely out-of-sample.
     """
+    # Everything the holding period changes about the model is derived here from
+    # training data only, and re-derived at every rebalance.
     R_est = to_returns(prices, freq, use_log)           # for estimation
     R_simple = to_returns(prices, freq, False)          # native realised P&L
     R_simple = R_simple.reindex(R_est.index).dropna()
@@ -1717,6 +1796,13 @@ def run_backtest(prices, freq, use_log, mu_builder, cov_method, freq_per_year, r
     n_rebalances = 0
     turnover_sum = 0.0
     port_value = float(capital) if (capital and capital > 0) else 1.0
+    # Where each holding period starts and stops inside `pnl`. The walk-forward
+    # loop already buys a portfolio and holds it for exactly one horizon before
+    # touching it again -- so every one of these segments IS a complete
+    # "buy it and hold it for a week / a month / a year" experiment. Recording
+    # the boundaries costs nothing and turns one 8-year path into a few hundred
+    # independent answers to the question people actually ask.
+    seg_bounds = []
 
     # Volatility targeting state. `hist` accumulates the fully-invested (k=1)
     # portfolio return of each period as it happens, so the scale applied at
@@ -1748,11 +1834,23 @@ def run_backtest(prices, freq, use_log, mu_builder, cov_method, freq_per_year, r
         tr = R_est.iloc[:i]                              # expanding window
         try:
             cov_tr = estimate_cov(tr, cov_method, freq_per_year)
-            mu_tr, sigma_tr = mu_builder(tr, cov_tr.values)
+            # The holding period reaches the model here: rescale each asset's
+            # variance by how it actually behaves over a hold of this length,
+            # measured on data available at this point and nowhere else.
+            if horizon_aware and rebalance_periods > 1:
+                vr_tr = variance_ratio(tr.values, rebalance_periods)
+                cov_use = apply_variance_ratio(cov_tr.values, vr_tr)
+                R_obj = horizon_returns(tr.values, rebalance_periods)
+                ppy_obj = freq_per_year / float(rebalance_periods)
+            else:
+                cov_use = cov_tr.values
+                R_obj = tr.values
+                ppy_obj = freq_per_year
+            mu_tr, sigma_tr = mu_builder(tr, cov_use)
             w = optimize_portfolio(objective, np.asarray(mu_tr, dtype=float), sigma_tr,
-                                   tr.values, rf, stance, max_weight, gross_limit,
+                                   R_obj, rf, stance, max_weight, gross_limit,
                                    alpha, freq_per_year, resample_n=resample_n,
-                                   delta=delta)
+                                   delta=delta, R_ppy=ppy_obj)
         except Exception:
             w = prev_w if n_rebalances > 0 else np.repeat(1.0 / n, n)
 
@@ -1807,6 +1905,7 @@ def run_backtest(prices, freq, use_log, mu_builder, cov_method, freq_per_year, r
             for r_t in seg_report:
                 port_value *= (1.0 + float(r_t))
 
+        seg_bounds.append((len(pnl) - (end_j - i), len(pnl), i, end_j))
         pnl_unscaled.extend(seg_report.tolist())        # same strategy, always fully invested
         dates.extend(list(R_simple.index[i:end_j]))
         prev_w = w_drift                                # what we actually hold now
@@ -1825,6 +1924,25 @@ def run_backtest(prices, freq, use_log, mu_builder, cov_method, freq_per_year, r
     wb = np.repeat(1.0 / n, n)
     pb_native, _ = buy_and_hold_returns(R_simple.iloc[start_i:start_i + m].values, wb)
     pb = to_report(pb_native, start_i, start_i + m)                  # equal-weight, reporting ccy
+
+    # ---- one holding period at a time ----
+    # Compounded return of each individual hold, plus what the index did over
+    # exactly the same days. This is the honest answer to "if I buy this and
+    # hold it for one week, what happens?" -- not one path, but every such
+    # period the out-of-sample window contains.
+    pnl_arr = np.asarray(pnl, dtype=float)
+    idx_full = (to_report(idx_ret[start_i:start_i + m], start_i, start_i + m)
+                if (bench_prices is not None and np.any(idx_ret[start_i:start_i + m] != 0))
+                else None)
+    hold = []
+    for (a, b, i0, i1) in seg_bounds:
+        if b <= a or b > len(pnl_arr):
+            continue
+        r_s = float(np.prod(1.0 + pnl_arr[a:b]) - 1.0)
+        r_i = (float(np.prod(1.0 + idx_full[a:b]) - 1.0)
+               if idx_full is not None and b <= len(idx_full) else np.nan)
+        hold.append({"start": R_simple.index[i0], "end": R_simple.index[i1 - 1],
+                     "periods": int(b - a), "strat": r_s, "index": r_i})
 
     strat = perf_metrics(np.array(pnl), freq_per_year, rf, years=test_years)
     bench = perf_metrics(pb, freq_per_year, rf, years=test_years)
@@ -1866,6 +1984,7 @@ def run_backtest(prices, freq, use_log, mu_builder, cov_method, freq_per_year, r
             "dates": pd.DatetimeIndex(dates), "fx_applied": fx_applied,
             "train_start": R_est.index[0], "split_date": R_est.index[start_i],
             "n_test": m, "n_train": start_i, "test_years": float(test_years),
+            "holds": hold,
             "n_rebalances": n_rebalances, "rebal_label": rebal_label,
             "avg_turnover": turnover_sum / max(n_rebalances, 1)}
 
@@ -2272,6 +2391,134 @@ def render_view_impact(res):
                     f"it already believed.")
 
 
+def _render_horizon_effect(res):
+    """What the chosen holding period did — and, when it did nothing, why."""
+    vr = res.get("variance_ratio")
+    h = int(res.get("hold_periods", 1) or 1)
+    if vr is None or h <= 1:
+        return
+    vr = np.asarray(vr, dtype=float)
+    tick = res["usable"]
+    days = h
+    st.markdown(f"#### What holding for **{days} trading days** changed")
+
+    lower = int(np.sum(vr < 0.97)); higher = int(np.sum(vr > 1.03))
+    st.caption(
+        f"Scaling daily volatility by {days} assumes each day is independent of the last. "
+        f"Measured over actual {days}-day holds, **{lower}** of these {len(vr)} names turned out "
+        f"*less* volatile than that assumption implies and **{higher}** turned out *more*. "
+        f"The model uses the measured figure, so a name that settles down over a long hold can "
+        f"be held bigger, and one that trends away from you is held smaller.")
+
+    order = np.argsort(vr)
+    rows = [{"Ticker": tick[i], "Risk vs daily-scaled": f"{(vr[i]-1)*100:+.0f}%",
+             "Reads as": ("settles down over the hold" if vr[i] < 0.97
+                          else "drifts further over the hold" if vr[i] > 1.03
+                          else "behaves as daily data implies")}
+            for i in list(order[:3]) + list(order[-3:])]
+    st.dataframe(pd.DataFrame(rows), hide_index=True, width='stretch')
+
+    # The honest caveat: with no views and Max Sharpe this cannot move anything.
+    active = float(np.sum(np.abs(res["weights"] - res["w_mkt"]))) / 2
+    if not res.get("has_views") and res.get("objective") == "Max Sharpe":
+        st.info(
+            "**Your holding period cannot change this particular portfolio, and that is a "
+            "property of Black-Litterman rather than a fault.** With no views, the posterior "
+            "*is* the equilibrium prior, and the prior was built by reverse-optimising from the "
+            "market's own weights — so optimising it forward hands the market portfolio back, "
+            "whatever the covariance says. Rescaling risk for a longer hold rescales the prior "
+            "by exactly the same amount and it cancels.\n\n"
+            "To make the horizon bite, do one of two things: **add a view** (the tilt is "
+            "proportional to Σ, so a long hold tilts further into anything that settles down), "
+            "or switch **Optimisation goal** to *Min variance*, *Min CVaR* or *Max Sortino*, "
+            "which judge risk directly rather than reconstructing the market. On simulated data "
+            "those move the book by 40–65% between a one-day and a one-year hold.")
+    elif active < 0.01:
+        st.caption("This book is within 1% of the market portfolio, so there is little for the "
+                   "holding period to act on.")
+
+
+def _render_holding_periods(res, bt):
+    """What ONE holding period looked like, over and over.
+
+    The headline backtest answers "what if I ran this for eight years?". Most
+    people are asking something narrower and more useful: "if I buy this today
+    and hold it for a week, what happens?" The walk-forward loop has already
+    run that experiment a few hundred times -- every segment between two
+    rebalances is exactly one complete hold -- so this reports the spread of
+    those outcomes instead of a single compounded path.
+    """
+    holds = bt.get("holds") or []
+    if len(holds) < 3:
+        return
+    bc = res["base_currency"]; cap = res["total_capital"]
+    label = bt.get("rebal_label", "period")
+    unit = {"weekly": "week", "monthly": "month", "yearly": "year"}.get(label, "period")
+
+    r = np.array([h["strat"] for h in holds], dtype=float)
+    ri = np.array([h["index"] for h in holds], dtype=float)
+    have_idx = np.isfinite(ri).sum() >= max(3, len(ri) // 2)
+
+    st.markdown(f"#### If you bought this and held it for **one {unit}**")
+    st.caption(
+        f"The test window contains **{len(r)}** complete one-{unit} holds. Each one buys the "
+        f"portfolio the model recommended using only data available at the time, holds it "
+        f"untouched for one {unit}, and records what happened. This is the spread of those "
+        f"{len(r)} results — not one path through eight years.")
+
+    med = float(np.median(r)); win = float(np.mean(r > 0) * 100)
+    p5, p95 = float(np.percentile(r, 5)), float(np.percentile(r, 95))
+    h1, h2, h3, h4 = st.columns(4)
+    h1.metric(f"Typical {unit}", f"{med*100:+,.2f}%",
+              delta=f"{cap*med:+,.0f} {bc} on {cap:,.0f}", delta_color="off")
+    h2.metric(f"{unit.capitalize()}s in profit", f"{win:,.0f}%",
+              help=f"Share of the {len(r)} holds that ended above where they started.")
+    h3.metric("Best / worst", f"{r.max()*100:+,.1f}% / {r.min()*100:+,.1f}%")
+    h4.metric("Usual range (5–95%)", f"{p5*100:+,.1f}% to {p95*100:+,.1f}%",
+              help="Nine out of ten holds landed inside this band. The other one did not.")
+
+    st.markdown(
+        f"**In plain terms.** Put **{cap:,.0f} {bc}** in, leave it for one {unit}, and the "
+        f"middle outcome is **{cap*med:+,.0f} {bc}**. About **{win:,.0f}%** of the time you "
+        f"end the {unit} up. The worst single {unit} in this window lost "
+        f"**{cap*abs(r.min()):,.0f} {bc}** ({r.min()*100:,.1f}%), the best gained "
+        f"**{cap*r.max():,.0f} {bc}**. One {unit} is a coin-flip-ish outcome; the compounded "
+        f"eight-year figure above is what repeating it {len(r)} times produced on this "
+        f"particular stretch of history.")
+
+    if have_idx:
+        beat = float(np.mean(r[np.isfinite(ri)] > ri[np.isfinite(ri)]) * 100)
+        st.caption(
+            f"Against **{bt.get('index_label', 'the index')}** over the very same days: this "
+            f"portfolio finished ahead in **{beat:,.0f}%** of the {int(np.isfinite(ri).sum())} "
+            f"holds. A number near 50% means the two are hard to tell apart over a single "
+            f"{unit}, whatever the eight-year totals say.")
+
+    if len(r) <= 20:
+        st.caption(f"Only {len(r)} holds fit in the test window at this horizon, so read the "
+                   f"spread as indicative rather than as a distribution. Shorter horizons give "
+                   f"far more samples of the same question.")
+        show = pd.DataFrame([{"From": h["start"].date(), "To": h["end"].date(),
+                              f"Return %": h["strat"] * 100,
+                              f"P&L ({bc})": h["strat"] * cap} for h in holds])
+        st.dataframe(pretty_df(show, {f"Return %": 2, f"P&L ({bc})": 0}),
+                     hide_index=True, width='stretch')
+    else:
+        fig, axh = plt.subplots(figsize=(9, 2.6))
+        axh.hist(r * 100, bins=min(40, max(10, len(r) // 8)),
+                 color="#1f77b4", alpha=0.85, edgecolor="none")
+        axh.axvline(0, color="black", lw=1.0)
+        axh.axvline(med * 100, color="#d62728", lw=1.4, ls="--",
+                    label=f"median {med*100:+.2f}%")
+        axh.set_xlabel(f"Return over one {unit} (%)")
+        axh.set_ylabel(f"Number of {unit}s")
+        axh.legend(fontsize=8)
+        axh.grid(alpha=0.25)
+        fig.tight_layout()
+        st.pyplot(fig, width='stretch')
+        plt.close(fig)
+
+
 def _render_backtest(res, bt, bt_eq=None):
     bc = res["base_currency"]; total_capital = res["total_capital"]
     ret_freq = res["ret_freq"]; freq_per_year = res["freq_per_year"]
@@ -2424,6 +2671,14 @@ def _render_backtest(res, bt, bt_eq=None):
         beat_market = (f" Just buying the {idx_label} index would have become {idx_final:,.0f} {bc}, so "
                        f"the strategy {'beat' if diff >= 0 else 'lagged'} the market by "
                        f"{abs(diff):,.0f} {bc}.")
+    # Most people are not asking "what if I ran this for eight years?". They are
+    # asking "what if I buy it and hold it for one week?". Answer that FIRST,
+    # before the compounded figure, because the compounded figure is the one
+    # that gets misread as a single-period outcome.
+    _render_horizon_effect(res)
+    _render_holding_periods(res, bt)
+
+    st.markdown("#### And if you kept repeating it")
     st.markdown(
         f"**In plain terms:** running this {reb}-rebalanced strategy, your {total_capital:,.0f} {bc} "
         f"would have become **{strat_final:,.0f} {bc}** — a {'profit' if strat_pnl >= 0 else 'loss'} of "
@@ -3180,11 +3435,13 @@ def main():
     # State the actual trade-off neutrally instead of steering.
     _reb_per_year = FREQ_PER_YEAR[ret_freq] / _reb_periods
     st.caption(
-        f"**All three horizons estimate from the same {hcfg['years']}-year daily history.** They "
-        f"differ only in how often you trade: this one rebalances about "
-        f"**{_reb_per_year:,.0f} times a year**. More rebalances means more decisions to judge the "
-        f"strategy on, and more trading costs; fewer means a cleaner read on the long-run "
-        f"allocation, from a smaller sample of decisions. Neither is more correct."
+        f"**\"How long will you hold?\" sets how long you keep the portfolio before "
+        f"adjusting it — not how long you invest for.** This setting holds each portfolio for "
+        f"about **{252/_reb_per_year:,.0f} trading days** before re-checking it. All three "
+        f"choices read the same {hcfg['years']}-year daily history, so they are directly "
+        f"comparable; they differ only in that holding length. The backtest then answers two "
+        f"separate questions: what **one** such hold looked like, and what happened when the "
+        f"whole thing was repeated across the test window. Neither horizon is more correct."
     )
 
     if mode != "Advanced":
@@ -3553,8 +3810,24 @@ def main():
             rf = float(rf_annual)
             cov = uni["cov"]; returns = uni["returns"]; prices = uni["prices"]
             freq_per_year = uni["freq_per_year"]
-            Sigma = cov.values
             w_mkt = uni["w_mkt"]
+
+            # ---- the holding period reaches the model ----
+            # Scaling daily variance by the number of days assumes returns are
+            # independent day to day. They are not. An asset that mean-reverts
+            # is genuinely less risky over a year than its daily volatility
+            # implies and should be held in larger size for a long hold; a
+            # trending one is riskier and should be held in smaller size. This
+            # rescales each asset's variance by its measured behaviour over a
+            # hold of exactly this length, which is what makes a one-week
+            # portfolio differ from a one-year one at all.
+            _vr = variance_ratio(returns.values, _reb_periods) if _reb_periods > 1 \
+                else np.ones(returns.shape[1])
+            Sigma = apply_variance_ratio(cov.values, _vr) if _reb_periods > 1 else cov.values
+            # Loss-based objectives judge the hold, not the day.
+            _R_obj = horizon_returns(returns.values, _reb_periods) if _reb_periods > 1 \
+                else returns.values
+            _R_ppy = freq_per_year / float(max(_reb_periods, 1))
 
             if sys_engine is not None:
                 # Rule-driven: P, Q and the confidence all come from price history.
@@ -3638,9 +3911,9 @@ def main():
                     weights = stack.mean(axis=0)
                     wstd = stack.std(axis=0)
                 else:
-                    weights = optimize_portfolio(objective, mu.values, Sigma_used, returns.values, rf,
+                    weights = optimize_portfolio(objective, mu.values, Sigma_used, _R_obj, rf,
                                                  stance, max_weight, gross_limit, cvar_alpha,
-                                                 freq_per_year, delta=delta)
+                                                 freq_per_year, delta=delta, R_ppy=_R_ppy)
                     wstd = None
             except Exception as e:
                 st.error(f"Optimisation failed: {e}")
@@ -3651,9 +3924,11 @@ def main():
             try:
                 mu_mk = estimate_mu(returns, "James-Stein shrinkage", freq_per_year, rf,
                                     cov_annual=Sigma, market_caps=uni["caps"])
-                w_markowitz = optimize_portfolio(objective, mu_mk.values, Sigma, returns.values, rf,
+                # Same horizon treatment, so the side-by-side comparison stays
+                # like for like.
+                w_markowitz = optimize_portfolio(objective, mu_mk.values, Sigma, _R_obj, rf,
                                                  stance, max_weight, gross_limit, cvar_alpha,
-                                                 freq_per_year)
+                                                 freq_per_year, R_ppy=_R_ppy)
             except Exception:
                 w_markowitz = None
 
@@ -3897,6 +4172,8 @@ def main():
             st.session_state["res"] = {
                 "base_currency": base_currency, "total_capital": invest_capital, "usable": usable,
                 "max_weight_pct": float(max_weight_pct),
+                "variance_ratio": _vr, "hold_periods": int(_reb_periods),
+                "objective": objective,
                 "has_holdings": has_holdings, "held_value": held_value,
                 "held_problems": held_problems, "n_held_priced": n_held_priced,
                 "new_cash": float(new_cash), "w_prev_live": w_prev_live,
