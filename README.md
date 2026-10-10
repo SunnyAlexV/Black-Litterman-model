@@ -3,30 +3,38 @@
 [![live app](https://img.shields.io/badge/live%20app-streamlit-FF4B4B?logo=streamlit&logoColor=white)](https://black-litterman-model.streamlit.app/)
 [![python](https://img.shields.io/badge/python-3.11-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![licence](https://img.shields.io/badge/licence-MIT-black)](LICENSE)
+[![tests](https://github.com/SunnyAlexV/Black-Litterman-model/actions/workflows/tests.yml/badge.svg)](https://github.com/SunnyAlexV/Black-Litterman-model/actions/workflows/tests.yml)
 
 **Start from the portfolio the market is already holding, then tilt it only as far as your views — and your confidence in them — justify.**
 
 ### ▶ [Try it live](https://black-litterman-model.streamlit.app/)
 
-*Out-of-sample walk-forward test: the model against its own equilibrium prior, an equal-weight basket, and the index. Every line is re-derived at each rebalance from data available at that point only.*
+![Walk-forward backtest on the global multi-asset ETF universe](results/equity_global_etf.png)
+
+*Global multi-asset ETFs, walk-forward with yearly rebalancing, 2018 to today. The solid line is the equilibrium prior rebuilt at each rebalance from market caps as they stood **on that date**. The dashed line is the same model fed today's caps, which is what earlier versions of this app did. The gap between them is look-ahead bias. Regenerate the chart with `python reproduce_results.py`.*
 
 ---
 
 ## What makes this different from the other portfolio optimisers on GitHub
 
-- **183 headless tests**, including a regression test that feeds the volatility overlay two price series with **identical pasts and different futures** and proves its exposures are bit-identical before the divergence — the look-ahead failure that invalidates most backtests, caught by construction rather than by assertion.
-- **The implementation is validated, not just written.** With no views the posterior must reproduce its prior. Across four universes with δ from 2.04 to 4.69, the gap never exceeds **0.67pp**. On the ETF universe, where no constraint binds, the BL weights match the market weights to two decimals.
-- **View confidence is earned, not typed.** Each rule's realised hit rate is measured walking forward, then converted to a confidence. Momentum scored 51–53% — chance — so it was assigned **2–4% confidence** and moved the portfolio almost nowhere. The app reports that views added nothing rather than hiding it.
-- **Three of its own bugs are documented in this README**, including one that made every rebalance frequency return the same answer, and a finding that a feature built here **cannot work** under the default objective.
+- **It found and fixed a look-ahead bias in its own prior.** Yahoo only reports *today's* market caps, and earlier versions built every historical prior from them, so a 2018 portfolio was handed the weights of the names that went on to win. That inflated backtested returns by **1.9pp a year on global ETFs and 11.2pp on the S&P 500 universe**. The prior now uses caps as they stood at each rebalance.
+- **The implementation is validated against theory.** With no views, Black-Litterman must hold the market portfolio. On both ETF universes, where no constraint binds, the back-tested prior and the cap-weighted market finish identical to **0.00pp in all 37 three-year windows** tested.
+- **"Did the views help?" gets an interval, not a point estimate.** A paired stationary block bootstrap and the Ledoit–Wolf (2008) HAC Sharpe test. Momentum's best case is +0.63pp a year with a 95% interval of **−0.34 to +1.67pp** (p = 0.24): no evidence of an edge in any of four universes.
+- **243 headless tests in three suites, run by GitHub Actions on every push**, including *divergent-futures* tests: two price histories identical until a date and different after it must produce bit-identical decisions before that date. That proves "no look-ahead" by construction for the volatility overlay, the view engines and the market-cap prior.
+- **Costs are an input and break-even is an output.** Gross by default. Set a one-way cost and every rebalance pays it, including the first purchase. The app also reports the cost at which a strategy's edge over its prior is used up, so you can compare it with your own broker instead of trusting a guess.
+- **Every real-data number in this README is reproduced by one script**, [`reproduce_results.py`](reproduce_results.py), which writes [`results/results.md`](results/results.md). The numbers will drift as the data window moves forward, which is the honest behaviour.
+- **Its own bugs are documented here**, including the look-ahead prior and one that made every rebalance frequency return the same answer, alongside a finding that a feature built here **cannot work** under the default objective.
 - **ETF universes are included specifically because the stock universes carry survivorship bias** — and the README says which numbers you may believe and which you may not.
-- **No trading costs, taxes or borrowing charges are modelled anywhere.** Every figure is gross, and the app says so on screen. Deliberate scope, stated rather than buried.
 
 ```bash
 git clone https://github.com/SunnyAlexV/Black-Litterman-model
 cd Black-Litterman-model
 pip install -r requirements.txt
-python test_bl_core.py            # 183 checks, no network needed
+python test_bl_core.py            # numeric core
+python test_pipeline.py           # end to end on synthetic data
+python test_inference.py          # inference, costs, start dates (all three need no network)
 python -m streamlit run black_litterman_portfolio.py
+python reproduce_results.py       # real data: every figure in this README (~2 min)
 ```
 
 ## The idea in one paragraph
@@ -39,7 +47,7 @@ You can see this working in the app: the **Markowitz wt %** column sits next to 
 
 It answers one question: **given the market's own portfolio and whatever views you hold, how should the money be allocated?**
 
-It does not model what allocating it would cost. There is no brokerage, no STT or stamp duty, no slippage, no market impact, no tax, and no borrowing charge on shorts anywhere in the code. Every number is gross. That is a scope choice, not an oversight — costs are broker-specific and vary with account size, venue and order size, and folding them in turned the app into a discussion about execution rather than allocation. Subtract your own costs from whatever it shows you, and remember they scale with trading frequency.
+Costs are **off by default** and every figure is then gross. That is a deliberate default, not an omission: costs are broker-specific and vary with account size, venue and order size. Set a one-way cost in Advanced settings and every rebalance pays it on the value traded, including the first purchase from cash. More usefully, the backtest reports the **break-even cost** at which a strategy's edge is used up, so you can compare that one number with what your broker actually charges. Taxes, stamp duty and borrowing charges on shorts are not modelled at all.
 
 ## Features
 
@@ -55,7 +63,7 @@ It does not model what allocating it would cost. There is no brokerage, no STT o
 
 Alongside the stock universes there are three ETF universes — **Global multi-asset**, **US sectors**, **Global equity regions**. These are not a convenience; they fix the deepest flaw in the stock version.
 
-Black-Litterman's prior only means something if **w is the market portfolio**. A hand-picked slice of 25 large caps is not one, and selecting today's most liquid names then back-testing them imports the answer: in the US stock run, the universe beat its own index by 16.6pp a year purely through survivorship and selection bias. An ETF spanning an asset class has none of that — it existed throughout the test window, and constituent churn is handled inside the fund.
+Black-Litterman's prior only means something if **w is the market portfolio**. A hand-picked slice of 25 large caps is not one, and selecting today's most liquid names then back-testing them imports the answer. On the S&P 500 universe the back-tested prior beats its own index by **9.9pp a year** even with point-in-time caps, and that is selection and survivorship alone. (Before the cap fix the figure was 21.1pp; the difference was the look-ahead described below.) An ETF spanning an asset class has none of that — it existed throughout the test window, and constituent churn is handled inside the fund.
 
 It is also the problem Black and Litterman actually wrote about in 1992: global allocation across markets, not stock selection. And the estimation burden collapses — 13 assets means 91 covariance parameters instead of 325, on inputs whose correlations are far more stable.
 
@@ -72,6 +80,8 @@ confidence = 2 x (hit rate - 50%)
 ```
 
 shrunk for sample size and capped below 100%. A rule that is right half the time carries no information and gets **zero** confidence, so the posterior ignores it entirely. On a random walk, no engine earns meaningful confidence — that is a test, not a claim.
+
+**The sample size is the number of independent dates, not the number of pairs scored.** Checks are spaced at least one holding period apart, so their forward windows never overlap, but each date scores two or more pairs that share the same market move. Counting pairs would double the apparent evidence. The app shows the independent count and a one-sided p-value against a coin flip.
 
 The backtest then runs the rule against pure equilibrium and reports the difference. A universe you did not pick, views you did not guess, confidence you did not choose.
 
@@ -210,38 +220,81 @@ Two details that are easy to get wrong:
 
 **A trade smaller than one lot is a hold.** Printing "buy 0.4 shares" is not an instruction, so anything under a lot is reported as HOLD rather than as a fractional target nobody can execute.
 
+### Point-in-time market caps
+
+The prior is π = δΣw, and **w** has to be the market portfolio *as it stood when the decision was made*. Yahoo reports only today's market capitalisation, so earlier versions of this app built the 2018 prior from 2026 caps. That hands the 2018 portfolio the weights of whichever names went on to win, and it contaminates δ, which is implied from the same weights.
+
+The fix back-casts each cap along its own price path:
+
+```
+cap_i(t) ≈ cap_i(today) × P_i(t) / P_i(today)
+```
+
+This is exact if the share count is fixed, and it uses no price after *t*: today's price enters only to convert today's cap back into a share count. A divergent-futures test proves it (identical histories, different futures → bit-identical weights before the split), and a second test checks a consequence: buy the back-cast weights at the start, let them drift, and you arrive exactly at today's cap weights.
+
+Three approximations remain, all stated rather than hidden. Buybacks and issuance change share counts, which the back-cast ignores. Prices are dividend-adjusted, so high-yield names' past caps are understated by roughly their cumulative yield. And for an ETF the "cap" is fund AUM, which also contains years of inflows that no price path can remove (XLK's weight at the test start comes out at 17.6% against 35.9% today, and part of that drop is flows, not price).
+
+### Is a gap real? Intervals, not point estimates
+
+A single backtest returns one number per strategy. Whether a gap between two of them means anything depends on how noisy that number is, and one path cannot tell you. The app answers it two ways, both on the **paired** per-period returns of the strategy and its pure-equilibrium twin. The two hold nearly the same portfolio, and that correlation is exactly what makes a small gap measurable.
+
+- **Stationary block bootstrap** (Politis & Romano, 1994). It resamples blocks of consecutive periods, with mean length T^(1/3), so volatility clustering survives. An i.i.d. bootstrap would destroy that clustering and understate the uncertainty; a test checks that on AR(1) data the block version recovers the (1+φ)/(1−φ) variance inflation that the i.i.d. version misses. Both strategies are resampled on the same dates.
+- **Ledoit & Wolf (2008) Sharpe-difference test.** With v = (μ₁, μ₂, E[r₁²], E[r₂²]) the delta method gives Var(ŜR₁ − ŜR₂) ≈ ∇f′ Ψ ∇f / T, where Ψ is a Newey–West HAC covariance. On i.i.d. normal data it matches the Jobson–Korkie/Memmel closed form within 0.2%, and it rejects a true null in 4.2% of 1,000 simulations at the 5% level.
+
+When the interval contains zero the app says the precise thing: *no evidence* of a difference, which is not proof of none. When it doesn't, the app says that four rules are on offer, so a Bonferroni bar is p < 0.0125.
+
+### Trading costs and break-even
+
+Turnover at each rebalance is Σ|w_new − w_drifted|, measured against the weights the book has actually drifted to. At a one-way cost *c*, the portfolio loses c × turnover of its value at the moment of trading. Under the volatility overlay that loss is scaled by the exposure, so only the invested fraction pays.
+
+Costs cut annual return by roughly cost × annual turnover, so strategy A stays ahead of B while
+
+```
+gap  >  cost × (turnover_A − turnover_B)      →      break-even = gap / (turnover_A − turnover_B)
+```
+
+It is a first-order figure (it ignores compounding) and the app labels it as one.
+
+### The same test from many start dates
+
+One backtest is one path from one start date. Ticking *Repeat the backtest from many start dates* re-runs it over three-year windows starting every six months, truncating the history at each window's end so nothing later leaks in. The windows overlap, so the spread across them is **not** a confidence interval (the bootstrap does that job). It shows how much the headline depends on when you happened to start.
+
 ### Results on real data
 
-**Headline: Global multi-asset ETFs, yearly, 2022-04 to 2026-08.** This is the run whose absolute numbers mean something — every one of the thirteen ETFs existed throughout the test window, so there is no survivorship bias and no selection bias. 100,000 USD becomes **150,198 USD** (9.63% a year) with a −13.8% worst drawdown, against **132,968** for an equal-weight basket of the same assets.
+All figures in this section come from `python reproduce_results.py`. Figures elsewhere that describe how an earlier bug was found (the drift and calendar sections) come from runs made before point-in-time caps; they illustrate the mechanism and are not reproduced by the script. The run uses yearly rebalancing, Simple-mode defaults, the volatility overlay off so the model is isolated, and an out-of-sample window from mid/late 2018 to October 2026. All are gross of costs.
 
-**The model reproduces its prior, exactly as the theory requires.** With no meaningful views the posterior equals the prior, so the unconstrained optimum *is* the market portfolio. On the ETF universe, where no constraint binds, this is directly visible in the holdings table:
+**The look-ahead was large, and it was in the app's favour.** Annual return of the pure-equilibrium strategy:
 
-```
-        BL wt %   Market wt %
-SPY      53.80       53.80
-IWM       5.42        5.42
-GLD       8.82        8.82
-EEM       1.97        1.97
-```
+| Universe | Today's caps (old) | Point-in-time caps | Overstated by | Biggest weight change at test start |
+|---|---|---|---|---|
+| Global multi-asset ETFs | 11.44% | 9.51% | 1.9pp | SPY 54.4% → 36.3% |
+| US sector ETFs | 16.44% | 14.00% | 2.4pp | XLK 35.9% → 17.6% |
+| S&P 500, 25 names | 35.12% | 23.94% | 11.2pp | NVDA 14.5% → 1.7% |
+| Nifty 500, 25 names | 15.57% | 11.45% | 4.1pp | HDFCBANK 8.7% → 14.5% |
 
-Identical to two decimals. And out of sample, across four different universes and horizons:
+**With the leak removed, the model reproduces its prior exactly.** Black-Litterman with no views must hold the market portfolio. Gap between the back-tested prior and the cap-weighted market:
 
-| Run | BL (no overlay) vs its own prior |
-|---|---|
-| India Nifty, yearly | −0.23pp |
-| US S&P, yearly | −0.60pp |
-| US S&P, monthly | +0.05pp |
-| **Global multi-asset ETFs, yearly** | **−0.22pp** |
+| Universe | Old (today's caps) | Point-in-time | Across 3-year windows (10th–90th pct) |
+|---|---|---|---|
+| Global multi-asset ETFs | −0.65pp | **0.00pp** | 0.00 to 0.00pp, 19 windows |
+| US sector ETFs | −0.48pp | **0.00pp** | 0.00 to 0.00pp, 18 windows |
+| S&P 500, 25 names | −2.46pp | +0.45pp | −0.30 to +0.10pp, 17 windows |
+| Nifty 500, 25 names | +0.82pp | +0.53pp | −0.11 to +0.50pp, 18 windows |
 
-Four markets, δ from 2.04 to 4.69 — and the gap never exceeds two-thirds of a percentage point. That is the central validation of this implementation.
+On the ETF universes no constraint binds, so the match is exact, as theory requires. The small gaps on the stock universes are the 12% single-name cap doing its job. The old residual gap this README used to cite as validation (never more than 0.67pp) was itself produced by the leak.
 
-**Views added nothing, and the app measured it rather than assuming it.** Momentum's realised hit rate was 51% over 74 checks on the ETF universe and 53% over 68 on Indian equities — barely distinguishable from chance — so the calibration assigned 2% and 4% confidence respectively, and the portfolio tilted 0.7% and 3.0% away from the market. That reproduces the null result found across three view engines and two universes in the underlying CQF study, and it is worth contrasting with what happens when confidence is *typed*: at a hand-picked 75%, the same portfolio tilted 37.4% — roughly nineteen times harder than the evidence supported.
+**Views added nothing you can distinguish from zero.** Momentum (12-1) against pure equilibrium:
 
-**What the optimiser is worth, in one column.** On the same thirteen assets, plain mean-variance puts **66.8% in GLD and 33.2% in SPY** and nothing anywhere else — the classic corner solution. Black-Litterman produces a graded thirteen-asset allocation from the identical covariance matrix and constraints.
+| Universe | Hit rate (independent dates) | Confidence earned | Gap | 95% interval | p |
+|---|---|---|---|---|---|
+| Global multi-asset ETFs | 68% (14, p = 0.09) | 13% | +0.63pp | −0.34 to +1.67pp | 0.24 |
+| US sector ETFs | 46% (13) | 0% | 0.00pp | — | — |
+| S&P 500, 25 names | 62% (13, p = 0.20) | 8% | −0.86pp | −2.03 to +0.44pp | 0.21 |
+| Nifty 500, 25 names | 50% (13) | 0% | 0.00pp | — | — |
 
-**The volatility overlay buys drawdown, not return.** On the US stock universe it took Sharpe from 1.02 to 1.05 with a drawdown nine points shallower than the prior's; on the ETF universe it cut drawdown from −18.9% to −13.8% and cost 1.6pp of return. Reliable on risk, neutral-to-negative on Sharpe — which is what the simulations said to expect.
+Where the rule earned no confidence the posterior equals the prior, so there is nothing to test. Where it earned some, the interval straddles zero. Across start dates the picture is the same: on global ETFs momentum trailed the prior in 63% of windows, and on the S&P 500 universe in 76%. This reproduces the null result of the underlying CQF study with a proper test behind it. The one positive point estimate would need costs below about 275bps one-way to survive. That bar is easy to clear in practice, but there is no established edge for the costs to erode.
 
-**A caveat on the stock universes.** Their absolute returns are not meaningful: the universe is the most liquid names in each index *today*, which are disproportionately the ones that won over the test period. The US stock universe beat the S&P 500 by 16.6pp a year on that basis alone, and the app flags any gap above 8pp as look-ahead bias. Only the strategy-versus-its-own-prior comparison survives there. The ETF universes exist precisely so there is a run without that problem.
+**A caveat on the stock universes.** Their absolute returns are still not meaningful: the universe is the most liquid names in each index *today*, which are disproportionately the ones that won. Point-in-time caps fix the weights; they cannot fix the selection. Only the strategy-versus-its-own-prior comparisons survive there, and the ETF universes exist precisely so there is a run without that problem.
 
 ### Honest diagnostics
 
@@ -271,7 +324,7 @@ Both are now decoupled. Every horizon estimates from the same 15-year daily hist
 | Monthly — medium-term | up to 15 years | daily | ~12/year | ~3,780 |
 | Yearly — long-term | up to 15 years | daily | ~1/year | ~3,780 |
 
-Neither setting is the "good" one. More rebalances give more decisions to judge the strategy on; fewer give a cleaner read on the long-run allocation from a smaller sample of decisions. No trading costs are modelled, so the app makes no claim about which frequency is cheaper. The app says exactly that and does not steer.
+Neither setting is the "good" one. More rebalances give more decisions to judge the strategy on; fewer give a cleaner read on the long-run allocation from a smaller sample of decisions. Costs are off by default, so the app makes no claim about which frequency is cheaper; set a cost in Advanced settings and the backtest will tell you. The app says exactly that and does not steer.
 
 **The window is chosen from the data, not imposed.** Demanding a fixed 15 years would silently discard every asset younger than that — half a Nifty universe in practice — while a naive `dropna()` would truncate *every* asset to the youngest one's history. Instead the app walks the window down from 15 years and stops at the longest length that still supports a full-sized universe, backfilling excluded names from the next most liquid long-lived candidates. A universe where nothing is old shortens the window gracefully rather than failing.
 
@@ -289,36 +342,32 @@ Choosing a market applies sensible defaults automatically — the local risk-fre
 
 The risk-free rates are August 2026 government bill yields, hardcoded in `MARKET_DEFAULTS` at the top of the file. They will drift — update them there.
 
-## Run it locally
+## How the code is organised
 
-```bash
-git clone https://github.com/SunnyAlexV/Black-Litterman-model.git
-cd Black-Litterman-model
-pip install -r requirements.txt
-streamlit run black_litterman_portfolio.py
-```
+| Module | What it holds |
+|---|---|
+| `bl_config.py` | Markets, horizons, defaults. Imports nothing from the project. |
+| `bl_data.py` | Yahoo Finance: prices, market caps, FX. The only module that touches the network. |
+| `bl_core.py` | The maths: returns, covariance, Black-Litterman, Ω, view engines, point-in-time caps, optimiser. |
+| `bl_backtest.py` | Walk-forward engine, drift between rebalances, volatility overlay, costs. |
+| `bl_inference.py` | Block bootstrap, Ledoit–Wolf Sharpe test, break-even cost, hit-rate p-value. |
+| `bl_execution.py` | Whole-share allocation, board lots, parsing pasted holdings. |
+| `bl_pipeline.py` | The whole model with no UI: `Settings` → `load_universe` → `run_backtests` → `rolling_origin`. |
+| `black_litterman_portfolio.py` | The Streamlit app, and nothing else. Re-exports the modules so existing imports keep working. |
+
+The app and `reproduce_results.py` call the same `bl_pipeline` functions, so a number on screen and a number in this README come from one code path. When the pipeline was extracted, a parity check ran the old and new apps on live data and confirmed all 25 on-screen metrics were identical on two universes. Two latent bugs surfaced in the process and were fixed. Choosing weekly returns in Advanced mode had silently turned "rebalance every 21 periods" into every 21 *weeks*. And when market caps were missing, the live screen and the backtest fell back to different priors.
 
 On Windows, if `streamlit` isn't on your PATH, use `python -m streamlit run black_litterman_portfolio.py`.
 
 ## Tests
 
 ```bash
-python test_bl_core.py
+python test_bl_core.py      # 191 checks: the numeric core
+python test_pipeline.py     # 23 checks: end to end on a synthetic market
+python test_inference.py    # 29 checks: inference, costs, hit-rate sample size, start dates
 ```
 
-183 headless checks covering the numeric core, with Streamlit and yfinance stubbed so nothing needs a server or a network connection. They check reverse optimisation round-trips, that the two posterior formulas agree, Ω construction under both methods, view parsing and excess-return conversion, τ invariance, confidence linearity, the volatility overlay's no-look-ahead property, the negative-Sharpe artifact, the share allocator (never overspends, respects board lots, strands less than one lot), the relative volatility target, the systematic view engines — both proven free of look-ahead by divergent-futures tests — the adaptive history window, that the vectorised Ledoit-Wolf estimator matches the textbook loop to machine precision, and the holdings parser (separators, missing suffixes, thousands separators, unknown tickers reported rather than dropped).
-
-Two properties worth knowing about, both locked down by tests:
-
-**τ has no effect on posterior returns.** Under both Ω methods, Ω is itself proportional to τ, so it cancels out of the posterior entirely. τ only bites when posterior covariance is enabled. To change how far your views move the portfolio, use confidence.
-
-**Under Idzorek, the tilt is exactly linear in confidence:**
-
-```
-shift in expected return = confidence × (your view − what the equilibrium already implied)
-```
-
-A view 5pp above equilibrium at 75% confidence moves μ by exactly 3.75pp. It follows that a view agreeing with the equilibrium changes nothing at any confidence — check the *Surprise* column before reaching for the confidence dial.
+All three stub Streamlit and yfinance, so they need no server and no network, and GitHub Actions runs them on every push. They cover reverse-optimisation round-trips, agreement between the two posterior formulas, Ω under both methods, view parsing and excess-return conversion, τ invariance, confidence linearity, the share allocator, the adaptive history window, the vectorised Ledoit-Wolf estimator, and the holdings parser. Divergent-futures tests prove the absence of look-ahead in the volatility overlay, the view engines and the market-cap prior. On the statistics side, a constant per-period edge must be recovered exactly with a zero-width interval, the HAC Sharpe test must match the closed form on i.i.d. data and hold its size under the null, and zero cost must reproduce the gross backtest bit for bit.
 
 ## How to use it
 
@@ -336,12 +385,13 @@ Read these before drawing conclusions, and certainly before allocating real mone
 
 - **The universe is a hardcoded list, not a real index.** "Nifty 500" is 86 tickers; "S&P 500" is 100. The theoretical claim of Black-Litterman rests on the prior being *the market portfolio* — a cap-weighted slice of 25 liquid large caps is not that.
 - **Market caps come from Yahoo and are unverified.** The whole prior is built on them. Missing caps are filled with the median and reported; a cap that is present but wrong fails silently.
+- **Historical caps are back-cast, not observed.** Share-count changes are ignored, dividend adjustment understates high-yield names' past caps, and an ETF's AUM includes flows. Each is small next to the bias it replaces, but none is zero.
 - **Survivorship bias.** Optimises over each index's *current* constituents, so delisted and demoted companies never appear. This systematically overstates historical returns.
-- **The backtest is a single path.** One market, one sequence of history, a handful of rebalances. It cannot separate skill from luck.
+- **The backtest is one market's history.** The bootstrap and the start-date study quantify how noisy a result is *within* that history. They cannot tell you whether the history itself was typical.
 - **Views are opinions.** The model faithfully amplifies them in proportion to your stated confidence. Confident and wrong is the expensive quadrant.
-- **No costs of any kind are modelled** — no brokerage, no STT or stamp duty, no slippage, no market impact, no taxes, no borrowing charge on shorts. Every figure is gross. This is deliberate: the app answers *how should the money be allocated*, not *what will my broker charge*. Your own costs come off the top, and they scale with how often you trade, so the higher-frequency horizons are the most flattered by their absence.
+- **Costs are approximate when switched on, and absent when not.** A flat one-way rate, no market impact, no taxes, no borrowing charge on shorts. Gross by default.
 
-Closing this gap is mostly a data problem, not a coding one: point-in-time index membership, vendor market caps, and rolling-window backtests across many start dates.
+Closing the rest of the gap is a data problem, not a coding one: point-in-time index membership and vendor share counts.
 
 ## Tech stack
 
@@ -357,6 +407,9 @@ Educational and analytical tool. **Not investment advice.** Expected returns are
 - He, G. and Litterman, R. (1999), "The Intuition Behind Black-Litterman Model Portfolios", Goldman Sachs
 - Idzorek, T. (2005), "A Step-by-Step Guide to the Black-Litterman Model"
 - Ledoit, O. and Wolf, M. (2004), "A Well-Conditioned Estimator for Large-Dimensional Covariance Matrices"
+- Ledoit, O. and Wolf, M. (2008), "Robust Performance Hypothesis Testing with the Sharpe Ratio", *Journal of Empirical Finance*
+- Politis, D. and Romano, J. (1994), "The Stationary Bootstrap", *Journal of the American Statistical Association*
+- Newey, W. and West, K. (1994), "Automatic Lag Selection in Covariance Matrix Estimation", *Review of Economic Studies*
 
 ## License
 

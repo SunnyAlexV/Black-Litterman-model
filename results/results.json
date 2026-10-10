@@ -1,0 +1,270 @@
+{
+  "generated": "2026-10-10T12:01:49",
+  "horizon": "Yearly \u2014 long-term",
+  "results": [
+    {
+      "market": "Global multi-asset (ETFs)",
+      "n_assets": 13,
+      "freq": "Weekly",
+      "window": [
+        "2011-10-10",
+        "2026-10-05"
+      ],
+      "leak": {
+        "test_start": "2018-07-13",
+        "prior_old": 0.11441491498286926,
+        "prior_new": 0.09514254777438969,
+        "market_old": 0.120952647690866,
+        "market_new": 0.09514254777438924,
+        "gap_old": -0.006537732707996735,
+        "gap_new": 4.440892098500626e-16,
+        "index_ret": null,
+        "vs_index_old": null,
+        "vs_index_new": null,
+        "weight_shift_at_start": 0.21479321209457594,
+        "biggest_mover": "SPY",
+        "biggest_mover_old_new": [
+          0.5439046384359684,
+          0.36314284701371696
+        ]
+      },
+      "views": {
+        "hit_rate": 0.6785714285714286,
+        "independent_dates": 14,
+        "hit_p": 0.09072460386071014,
+        "confidence": 0.12820512820512822,
+        "rule_ret": 0.10145727639803304,
+        "eq_ret": 0.09514254777438969,
+        "gap": 0.006314728623643351,
+        "boot_diff": 0.005755980303005261,
+        "boot_lo": -0.003407769031038905,
+        "boot_hi": 0.016745226040223656,
+        "boot_p": 0.244,
+        "sharpe_diff": 0.047421948533515654,
+        "sharpe_p": 0.2545866211786493,
+        "breakeven_bps": 274.8552976459652,
+        "turnover_rule": 0.3510929012194819,
+        "turnover_eq": 0.12134551495017276
+      },
+      "rolling": {
+        "prior_vs_market": {
+          "n_windows": 19,
+          "median_gap": 2.220446049250313e-16,
+          "p10": -2.6645352591003756e-16,
+          "p90": 7.549516567451061e-16,
+          "share_positive": 0.0,
+          "share_negative": 0.0,
+          "vs": "cap-weighted market"
+        },
+        "rule_vs_prior": {
+          "n_windows": 19,
+          "median_gap": -0.001716643455284883,
+          "p10": -0.011742949834892791,
+          "p90": 0.005165146701491527,
+          "share_positive": 0.3684210526315789,
+          "share_negative": 0.631578947368421,
+          "vs": "pure equilibrium"
+        }
+      },
+      "seconds": 11.7
+    },
+    {
+      "market": "US sectors (ETFs)",
+      "n_assets": 9,
+      "freq": "Daily",
+      "window": [
+        "2011-10-10",
+        "2026-10-09"
+      ],
+      "leak": {
+        "test_start": "2018-07-10",
+        "prior_old": 0.16441859699544548,
+        "prior_new": 0.13997954108116017,
+        "market_old": 0.1691825835048013,
+        "market_new": 0.13997954108116129,
+        "gap_old": -0.004763986509355833,
+        "gap_new": -1.1102230246251565e-15,
+        "index_ret": null,
+        "vs_index_old": null,
+        "vs_index_new": null,
+        "weight_shift_at_start": 0.1827024696156621,
+        "biggest_mover": "XLK",
+        "biggest_mover_old_new": [
+          0.359151458927366,
+          0.17644898931170386
+        ]
+      },
+      "views": {
+        "hit_rate": 0.46153846153846156,
+        "independent_dates": 13,
+        "hit_p": 0.6092443525006432,
+        "confidence": 0.0,
+        "rule_ret": 0.13997196735558437,
+        "eq_ret": 0.13997954108116017,
+        "gap": -7.573725575804602e-06,
+        "boot_diff": -7.442470017299252e-06,
+        "boot_lo": -3.296630285752542e-05,
+        "boot_hi": 1.7251338696436885e-05,
+        "boot_p": 0.5625,
+        "sharpe_diff": -2.710021897136167e-05,
+        "sharpe_p": 0.6838907369879418,
+        "breakeven_bps": null,
+        "turnover_rule": 0.12177421295043193,
+        "turnover_eq": 0.12122469299701909
+      },
+      "rolling": {
+        "prior_vs_market": {
+          "n_windows": 18,
+          "median_gap": -3.3306690738754696e-16,
+          "p10": -1.909583602355269e-15,
+          "p90": 2.131628207280301e-15,
+          "share_positive": 0.0,
+          "share_negative": 0.0,
+          "vs": "cap-weighted market"
+        },
+        "rule_vs_prior": {
+          "n_windows": 18,
+          "median_gap": -2.665358715070454e-06,
+          "p10": -2.8014795433639606e-05,
+          "p90": 2.0351524910511293e-05,
+          "share_positive": 0.05555555555555555,
+          "share_negative": 0.0,
+          "vs": "pure equilibrium"
+        }
+      },
+      "seconds": 8.0
+    },
+    {
+      "market": "United States \u2014 S&P 500",
+      "n_assets": 25,
+      "freq": "Daily",
+      "window": [
+        "2012-05-18",
+        "2026-10-09"
+      ],
+      "leak": {
+        "test_start": "2018-11-07",
+        "prior_old": 0.35115933573455327,
+        "prior_new": 0.23940823100820063,
+        "market_old": 0.3757956631121706,
+        "market_new": 0.23494912360826614,
+        "gap_old": -0.02463632737761734,
+        "gap_new": 0.004459107399934492,
+        "index_ret": 0.14060446126271464,
+        "vs_index_old": 0.21055487447183863,
+        "vs_index_new": 0.09880376974548599,
+        "weight_shift_at_start": 0.2767149368870431,
+        "biggest_mover": "NVDA",
+        "biggest_mover_old_new": [
+          0.14463097214059156,
+          0.017203441408506534
+        ]
+      },
+      "views": {
+        "hit_rate": 0.6153846153846154,
+        "independent_dates": 13,
+        "hit_p": 0.20269027822947117,
+        "confidence": 0.07894736842105265,
+        "rule_ret": 0.23085300331932146,
+        "eq_ret": 0.23940823100820063,
+        "gap": -0.008555227688879175,
+        "boot_diff": -0.007823429057291331,
+        "boot_lo": -0.02030074104156639,
+        "boot_hi": 0.0044071319882704255,
+        "boot_p": 0.208,
+        "sharpe_diff": -0.020129402618531703,
+        "sharpe_p": 0.40482552627782153,
+        "breakeven_bps": null,
+        "turnover_rule": 0.29490991462034044,
+        "turnover_eq": 0.202120254430615
+      },
+      "rolling": {
+        "prior_vs_market": {
+          "n_windows": 17,
+          "median_gap": -4.931755580095398e-05,
+          "p10": -0.002958349913278413,
+          "p90": 0.0010272190900591398,
+          "share_positive": 0.23529411764705882,
+          "share_negative": 0.47058823529411764,
+          "vs": "cap-weighted market"
+        },
+        "rule_vs_prior": {
+          "n_windows": 17,
+          "median_gap": -0.004561961362421041,
+          "p10": -0.030929401198927307,
+          "p90": 0.0071119752827697915,
+          "share_positive": 0.23529411764705882,
+          "share_negative": 0.7647058823529411,
+          "vs": "pure equilibrium"
+        }
+      },
+      "seconds": 37.4
+    },
+    {
+      "market": "India \u2014 Nifty 500",
+      "n_assets": 25,
+      "freq": "Daily",
+      "window": [
+        "2011-10-10",
+        "2026-10-09"
+      ],
+      "leak": {
+        "test_start": "2018-07-13",
+        "prior_old": 0.1556810835093987,
+        "prior_new": 0.11445596288684246,
+        "market_old": 0.1474668542959432,
+        "market_new": 0.10913914301454009,
+        "gap_old": 0.008214229213455493,
+        "gap_new": 0.00531681987230237,
+        "index_ret": 0.09056057797081318,
+        "vs_index_old": 0.0651205055385855,
+        "vs_index_new": 0.023895384916029272,
+        "weight_shift_at_start": 0.22811623493239014,
+        "biggest_mover": "HDFCBANK.NS",
+        "biggest_mover_old_new": [
+          0.08708289940398055,
+          0.14544793697660546
+        ]
+      },
+      "views": {
+        "hit_rate": 0.5,
+        "independent_dates": 13,
+        "hit_p": 0.5,
+        "confidence": 0.0,
+        "rule_ret": 0.11445322717360029,
+        "eq_ret": 0.11445596288684246,
+        "gap": -2.7357132421634844e-06,
+        "boot_diff": -2.6507963910848975e-06,
+        "boot_lo": -1.2279287354819216e-05,
+        "boot_hi": 6.903772216280057e-06,
+        "boot_p": 0.596,
+        "sharpe_diff": -1.363085743376109e-05,
+        "sharpe_p": 0.6424708799703671,
+        "breakeven_bps": null,
+        "turnover_rule": 0.16888353869196715,
+        "turnover_eq": 0.1688988952516966
+      },
+      "rolling": {
+        "prior_vs_market": {
+          "n_windows": 18,
+          "median_gap": 0.0019284290419546712,
+          "p10": -0.0011241920033053133,
+          "p90": 0.004998844387593172,
+          "share_positive": 0.6111111111111112,
+          "share_negative": 0.3333333333333333,
+          "vs": "cap-weighted market"
+        },
+        "rule_vs_prior": {
+          "n_windows": 18,
+          "median_gap": 4.614985540385419e-07,
+          "p10": -0.0001733266108839392,
+          "p90": 0.0014368739713206636,
+          "share_positive": 0.16666666666666666,
+          "share_negative": 0.1111111111111111,
+          "vs": "pure equilibrium"
+        }
+      },
+      "seconds": 30.6
+    }
+  ]
+}

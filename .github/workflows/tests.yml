@@ -21,10 +21,13 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      # Both suites stub Streamlit and yfinance, so nothing here touches the
+      # All three suites stub Streamlit and yfinance, so nothing here touches the
       # network or needs a server. A red badge means the maths broke.
-      - name: Numeric core (183 checks)
+      - name: Numeric core
         run: python test_bl_core.py
 
-      - name: End-to-end pipeline (23 checks)
+      - name: End-to-end pipeline
         run: python test_pipeline.py
+
+      - name: Inference, costs and start-date robustness
+        run: python test_inference.py

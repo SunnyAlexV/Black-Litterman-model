@@ -1175,6 +1175,93 @@ check("a one-period rebalance is unaffected either way",
                             horizon_aware=False, **_BASE)["strat"]["ann_ret"]) < 1e-12)
 
 # =========================================================
+# Market-cap look-ahead: the prior must use caps as they stood at each rebalance
+# =========================================================
+# Ground truth with a fixed share count: cap_i(t) = shares_i * P_i(t). Under
+# that assumption the backcast must be EXACT, not approximate.
+_rc = np.random.default_rng(11)
+_nc, _Tc, _CUTc = 6, 1000, 700
+_Rc = _rc.normal(0.0004, 0.013, size=(_Tc, _nc))
+_idxc = pd.bdate_range("2018-01-01", periods=_Tc)
+_colc = [f"C{i}" for i in range(_nc)]
+_shares = _rc.uniform(1e6, 5e7, _nc)
+
+_RcB = _Rc.copy()
+# Future B: the smallest names explode, the largest collapse. If today's caps
+# leak into the past, the past weights will visibly change.
+_RcB[_CUTc:, :3] = _rc.normal(0.004, 0.02, size=(_Tc - _CUTc, 3))
+_RcB[_CUTc:, 3:] = _rc.normal(-0.003, 0.02, size=(_Tc - _CUTc, 3))
+_pxcA = pd.DataFrame(50 * np.cumprod(1 + _Rc, axis=0), index=_idxc, columns=_colc)
+_pxcB = pd.DataFrame(50 * np.cumprod(1 + _RcB, axis=0), index=_idxc, columns=_colc)
+_capsA = dict(zip(_colc, _shares * _pxcA.iloc[-1].values))
+_capsB = dict(zip(_colc, _shares * _pxcB.iloc[-1].values))
+
+_t_mid = _idxc[400]
+_bcA = bl.backcast_caps(_capsA, _pxcA, _t_mid)
+check("backcast is exact when the share count is fixed",
+      np.allclose([_bcA[c] for c in _colc], _shares * _pxcA.loc[_t_mid].values, rtol=1e-12))
+check("backcasting to the last date returns today's caps",
+      np.allclose([bl.backcast_caps(_capsA, _pxcA, _idxc[-1])[c] for c in _colc],
+                  [_capsA[c] for c in _colc], rtol=1e-12))
+
+
+def _w_at(caps, px, asof):
+    return bl.market_weights(_colc, bl.backcast_caps(caps, px, asof))[0]
+
+
+_pre = [_idxc[k] for k in (250, 500, _CUTc - 1)]
+_diff_bc = max(np.abs(_w_at(_capsA, _pxcA, d) - _w_at(_capsB, _pxcB, d)).max() for d in _pre)
+check("backcast cap weights read no future (identical before divergence)",
+      _diff_bc < 1e-12, f"max diff {_diff_bc:.2e}")
+_diff_naive = np.abs(bl.market_weights(_colc, _capsA)[0]
+                     - bl.market_weights(_colc, _capsB)[0]).max()
+check("whereas today's caps DO differ between the two futures (the old leak)",
+      _diff_naive > 0.05, f"naive diff {_diff_naive:.3f}")
+check("and backcast weights do react once the futures differ",
+      np.abs(_w_at(_capsA, _pxcA, _idxc[-50]) - _w_at(_capsB, _pxcB, _idxc[-50])).max() > 0.05)
+
+# Consistency: buy the backcast weights at t0 and let them drift. With a fixed
+# share count that IS the market portfolio, so it must arrive at today's weights.
+_t0 = 300
+_w0 = _w_at(_capsA, _pxcA, _idxc[_t0])
+_, _w_end = bl.buy_and_hold_returns(_pxcA.pct_change().values[_t0 + 1:], _w0)
+check("backcast weights drifted forward land exactly on today's cap weights",
+      np.allclose(_w_end, bl.market_weights(_colc, _capsA)[0], atol=1e-10))
+
+_bc_missing = bl.backcast_caps({**_capsA, "ZZZ": 1e9}, _pxcA, _t_mid)
+check("a cap with no price history becomes NaN rather than raising",
+      np.isnan(_bc_missing["ZZZ"]))
+
+# End to end: a BL backtest whose prior is built from backcast caps must make
+# identical decisions in both futures until the futures diverge.
+
+
+def _mk_builder(caps, px):
+    def _b(train_returns, cov_annual):
+        wm = _w_at(caps, px, train_returns.index[-1])
+        d, _ = bl.implied_risk_aversion(wm, cov_annual,
+                                        float(wm @ (train_returns.mean().values * 252)) - 0.04)
+        o = bl.black_litterman(cov_annual, wm, 0.04, 0.05, d,
+                               np.zeros((0, _nc)), np.zeros(0), np.zeros(0))
+        return o["mu_total"], o["Sigma_used"]
+    return _b
+
+
+_BTc = dict(freq="Daily", use_log=True, cov_method="Ledoit-Wolf shrinkage",
+            freq_per_year=252, rf=0.04, stance="Long only", max_weight=0.40,
+            gross_limit=None, objective="Max Sharpe", alpha=0.95, train_frac=0.45,
+            resample_n=0, rebalance_periods=63, rebal_label="quarterly", vol_target=None)
+_btcA = bl.run_backtest(_pxcA, mu_builder=_mk_builder(_capsA, _pxcA),
+                        caps_weights=lambda d: _w_at(_capsA, _pxcA, d), **_BTc)
+_btcB = bl.run_backtest(_pxcB, mu_builder=_mk_builder(_capsB, _pxcB),
+                        caps_weights=lambda d: _w_at(_capsB, _pxcB, d), **_BTc)
+_pre_holds = [(a["strat"], b["strat"]) for a, b in zip(_btcA["holds"], _btcB["holds"])
+              if a["end"] < _idxc[_CUTc]]
+check("BL backtest on backcast caps: every hold before divergence is identical",
+      len(_pre_holds) >= 2 and all(abs(x - y) < 1e-12 for x, y in _pre_holds),
+      f"{len(_pre_holds)} holds compared")
+
+# =========================================================
 print()
 if FAILURES:
     print(f"{len(FAILURES)} FAILED: " + ", ".join(FAILURES))

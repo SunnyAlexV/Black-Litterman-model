@@ -1,3 +1,9 @@
+"""Black-Litterman portfolio optimiser — Streamlit UI.
+
+The maths lives in bl_core, the backtest in bl_backtest, market data in bl_data
+and order sizing in bl_execution. This file is the interface only, and it
+re-exports everything so `import black_litterman_portfolio as bl` keeps working.
+"""
 import os
 import re
 import math
@@ -11,2082 +17,22 @@ import matplotlib.pyplot as plt
 from scipy.optimize import minimize, minimize_scalar
 from concurrent.futures import ThreadPoolExecutor
 
+
+from bl_config import *  # noqa: F401,F403
+from bl_data import *  # noqa: F401,F403
+from bl_execution import *  # noqa: F401,F403
+from bl_core import *  # noqa: F401,F403
+from bl_backtest import *  # noqa: F401,F403
+from bl_inference import *  # noqa: F401,F403
+from bl_pipeline import Settings, PipelineError, load_universe, run_backtests, \
+    fetch_benchmark_and_fx, market_weights_at, rolling_origin, summarise_rolling  # noqa: F401
+from bl_core import _scalar  # noqa: F401  (used by the tests)
+
 try:
     import plotly.graph_objects as go
     HAS_PLOTLY = True
 except Exception:
     HAS_PLOTLY = False
-
-# ---------------------------------------------------------
-# Private, app-controlled yfinance cache (kept out of OneDrive / synced
-# folders, which can corrupt the shared cache -> "database disk image is
-# malformed"). If the shared cache breaks, close the app and delete
-# %LOCALAPPDATA%\py-yfinance, then relaunch.
-# ---------------------------------------------------------
-_YF_CACHE = os.path.join(tempfile.gettempdir(), "yf_cache_black_litterman")
-try:
-    os.makedirs(_YF_CACHE, exist_ok=True)
-    yf.set_tz_cache_location(_YF_CACHE)
-except Exception:
-    pass
-
-# Quieten yfinance's per-ticker "possibly delisted / no timezone found" chatter —
-# failed symbols are retried and then simply skipped, so these are noise.
-logging.getLogger("yfinance").setLevel(logging.CRITICAL)
-
-FREQ_PER_YEAR = {"Daily": 252, "Weekly": 52, "Monthly": 12}
-FREQ_RULE = {"Daily": None, "Weekly": "W-FRI", "Monthly": "ME"}
-
-# Investment horizon -> years of history, return frequency, and how often the
-# walk-forward backtest rebalances (in return-periods) + a human label.
-# History windows. Longer is better for the COVARIANCE matrix, which is what
-# Black-Litterman actually leans on (pi = delta*Sigma*w), and the estimation
-# error there falls roughly as 1/sqrt(T). It is much less obviously better for
-# anything mean-like: a sample mean's standard error is driven by volatility,
-# not sample length, so decades are needed to pin one down — and the further
-# back you reach, the more you are averaging across regimes that no longer
-# exist. These windows are a compromise: long enough that Sigma is well
-# estimated, short enough that the data still describes the current world.
-# How long you intend to HOLD and how much history you should ESTIMATE FROM are
-# two different questions, and tying them together was the flaw in the earlier
-# design: choosing "weekly" quietly cut the estimation window to two years and
-# left the covariance matrix — and therefore pi = delta*Sigma*w — running on
-# fumes. Wanting to trade weekly is a preference; how much data Sigma needs is
-# a statistical fact, and the answer to the second is always "as much as is
-# reliably available".
-#
-# So every horizon now estimates from the same long window. The horizon sets
-# only the return frequency and how often the portfolio is rebalanced.
-HORIZON_CFG = {
-    "Weekly — short-term": {"years": 15, "min_years": 5, "freq": "Daily",
-                            "rebal": 5, "rebal_label": "weekly"},
-    "Monthly — medium-term": {"years": 15, "min_years": 5, "freq": "Daily",
-                              "rebal": 21, "rebal_label": "monthly"},
-    # Yearly estimates from DAILY returns too. Tying the return frequency to the
-    # holding period was the same mistake as tying the window length to it: a
-    # yearly rebalancer gained nothing from throwing away four fifths of its
-    # observations (780 weekly instead of 3,780 daily). All three horizons now
-    # see identical data and differ only in how often they trade.
-    "Yearly — long-term": {"years": 15, "min_years": 5, "freq": "Daily",
-                           "rebal": 252, "rebal_label": "yearly"},
-}
-
-# A single young ticker must not truncate everyone else. Keep a name only if it
-# covers at least this share of the chosen window.
-MIN_HISTORY_COVERAGE = 0.95
-# Sigma has n(n+1)/2 free parameters; this is the observations-per-asset bar the
-# adaptive window aims to clear before it stops lengthening.
-TARGET_OBS_PER_ASSET = 25
-
-
-def choose_history_window(close, candidates, want_n, hcfg, freq_per_year):
-    """Pick the longest history window that keeps a full-sized universe.
-
-    Forcing a fixed 15 years would silently discard every asset younger than
-    that — half a Nifty universe, in practice. Forcing a short window would
-    leave Sigma undernourished. So walk the window down from the maximum and
-    stop at the first length that still supports a proper universe and clears
-    the observations-per-asset bar.
-
-    Returns (start_timestamp, kept_tickers, note).
-    """
-    end = close.index.max()
-    max_y, min_y = float(hcfg["years"]), float(hcfg["min_years"])
-    per_year = freq_per_year
-    first_valid = {}
-    for t in candidates:
-        s = close[t].dropna()
-        if not s.empty:
-            first_valid[t] = s.index.min()
-    if not first_valid:
-        return close.index.min(), list(candidates), "no usable history"
-
-    need_n = max(5, int(math.ceil(0.8 * want_n)))
-    best = None
-    years = max_y
-    while years >= min_y - 1e-9:
-        start = end - pd.DateOffset(years=years)
-        cutoff = start + pd.Timedelta(days=int(365.25 * years * (1 - MIN_HISTORY_COVERAGE)))
-        keep = [t for t, d in first_valid.items() if d <= cutoff]
-        obs = years * per_year
-        if len(keep) >= need_n and (len(keep) == 0 or obs / max(len(keep), 1) >= TARGET_OBS_PER_ASSET):
-            best = (start, keep, years)
-            break
-        if best is None and len(keep) >= need_n:
-            best = (start, keep, years)
-        years -= 1.0
-
-    if best is None:
-        # Nothing clears the bar — take the longest window that keeps the most
-        # names, which is what the user would do by hand anyway.
-        start = end - pd.DateOffset(years=min_y)
-        keep = [t for t, d in first_valid.items() if d <= start + pd.Timedelta(days=180)]
-        if len(keep) < 3:
-            keep = sorted(first_valid, key=lambda t: first_valid[t])[:max(3, want_n)]
-            start = max(first_valid[t] for t in keep)
-        best = (start, keep, min_y)
-
-    start, keep, years = best
-    keep = [t for t in candidates if t in keep]          # preserve liquidity order
-    dropped = [t for t in candidates if t not in keep]
-    note = (f"Estimating from **{years:,.0f} years** of history "
-            f"({int(years * per_year):,} {hcfg['freq'].lower()} observations, "
-            f"~{int(years * per_year / max(len(keep), 1)):,} per asset). ")
-    if dropped:
-        note += (f"{len(dropped)} name(s) too young for that window were replaced by "
-                 f"longer-lived ones: {', '.join(dropped[:6])}"
-                 f"{'…' if len(dropped) > 6 else ''}. ")
-    return start, keep, note
-AUTO_HOLDINGS = 25  # stocks auto-selected in Simple mode
-
-# Market -> (broad index ticker, label) for the "beat the market" benchmark.
-BENCHMARKS = {
-    "United States — S&P 500": ("^GSPC", "S&P 500"),
-    "United Kingdom — FTSE 350": ("^FTSE", "FTSE 100"),
-    "Germany — HDAX": ("^GDAXI", "DAX"),
-    "France — SBF 120": ("^FCHI", "CAC 40"),
-    "Japan — Nikkei 225": ("^N225", "Nikkei 225"),
-    "India — Nifty 500": ("^NSEI", "Nifty 50"),
-    "Canada — S&P/TSX Composite": ("^GSPTSE", "S&P/TSX"),
-    "Australia — S&P/ASX 200": ("^AXJO", "ASX 200"),
-    "Hong Kong — Hang Seng Composite": ("^HSI", "Hang Seng"),
-}
-
-# Per-market recommended defaults, applied automatically when the market is
-# chosen. rf is the local short-dated government yield -- the opportunity cost
-# the equilibrium prior is measured against.
-#   rf sources: 1-year government bill yields, August 2026.
-MARKET_DEFAULTS = {
-    "United States — S&P 500":         {"rf": 0.041},
-    "United Kingdom — FTSE 350":       {"rf": 0.040},
-    "Germany — HDAX":                  {"rf": 0.023},
-    "France — SBF 120":                {"rf": 0.024},
-    "Japan — Nikkei 225":              {"rf": 0.008},
-    "India — Nifty 500":               {"rf": 0.060},
-    "Canada — S&P/TSX Composite":      {"rf": 0.031},
-    "Australia — S&P/ASX 200":         {"rf": 0.037},
-    "Hong Kong — Hang Seng Composite": {"rf": 0.035},
-}
-DEFAULT_RF = 0.04
-
-
-# Recommended defaults for the settings that actually change the answer.
-DEFAULT_MAX_WEIGHT_PCT = 12     # single-STOCK cap; keeps ~8+ real positions
-DEFAULT_ASSET_CLASS_CAP_PCT = 70  # asset classes: the market really is concentrated,
-                                  # so a tight cap would forbid holding the prior
-DEFAULT_TRAIN_FRAC = 0.45       # leaves a long enough out-of-sample window to mean something
-DEFAULT_VIEW_CONFIDENCE = 75.0  # Idzorek confidence: tilt 75% of the way from market to view
-DEFAULT_VOL_TARGET_PCT = 12.0        # absolute-mode target, when the user picks a fixed number
-DEFAULT_VOL_TARGET_FRAC_PCT = 75     # relative-mode default: run at 75% of the book's own risk
-
-
-def market_default(market_name, key):
-    return MARKET_DEFAULTS.get(market_name, {}).get(key, DEFAULT_RF)
-
-
-def affordable_holdings(last_prices, capital, target_n, min_n=5, lots_per_name=3.0):
-    """How many names can this capital actually express?
-
-    A portfolio of 19 names funded with 100,000 INR sounds fine until you try to
-    buy it: each position is allocated ~5,000, share prices run 400-2,300, and
-    every position rounds down and strands most of a share. In one real run that
-    left 18% of the money in cash — a drag larger than anything the optimiser
-    was arguing about.
-
-    Rule of thumb used here: each position should be able to buy at least
-    `lots_per_name` board lots, so its weight is expressible rather than
-    quantised to zero or one share. Returns the largest n <= target_n that
-    clears that bar.
-    """
-    px = np.asarray([p for p in last_prices if np.isfinite(p) and p > 0], dtype=float)
-    if px.size == 0 or capital <= 0:
-        return target_n
-    px = np.sort(px)[::-1]                      # dearest first: the binding ones
-    for n in range(int(target_n), int(min_n) - 1, -1):
-        if n > px.size:
-            continue
-        typical = float(np.median(px[:n]))      # median lot cost among the n held
-        if capital / n >= lots_per_name * typical:
-            return n
-    return int(min_n)
-
-
-def allocate_shares(targets, prices, lots, capital):
-    """Turn target cash allocations into whole-share (or whole-lot) counts.
-
-    Flooring every position independently is what strands the cash: each name
-    loses up to one lot, and nineteen names lose nineteen part-lots. So we floor
-    first, then spend what's left greedily on whichever position sits furthest
-    BELOW its target and can still fit another lot.
-
-    This never overspends, and never pushes a position more than one lot past
-    its target (once a name reaches target its shortfall goes non-positive and
-    it stops being a candidate). Leftover cash ends up smaller than the cheapest
-    lot still buyable, instead of the sum of nineteen roundings.
-
-    targets/prices/lots are aligned sequences; only LONG positions are topped up
-    (a short's cash mechanics are not the same trade-off). Returns share counts.
-    """
-    t = np.asarray(targets, dtype=float)
-    p = np.asarray(prices, dtype=float)
-    L = np.asarray(lots, dtype=float)
-    n = len(t)
-    shares = np.zeros(n)
-    ok = np.isfinite(p) & (p > 0) & np.isfinite(t) & (L > 0)
-
-    # 1) floor every position to whole lots
-    for i in range(n):
-        if not ok[i]:
-            continue
-        units = int(math.floor(abs(t[i]) / p[i]))
-        shares[i] = (units // int(L[i])) * int(L[i]) * (1.0 if t[i] >= 0 else -1.0)
-
-    # 2) greedily spend the remainder on the most under-filled long positions
-    spent = float(np.sum(np.where(shares > 0, shares * p, 0.0)))
-    long_target = float(np.sum(np.where(t > 0, t, 0.0)))
-    cash = min(capital, long_target) - spent
-    for _ in range(10000):                       # bounded: each pass buys one lot
-        best_i, best_gap = -1, 0.0
-        for i in range(n):
-            if not ok[i] or t[i] <= 0:
-                continue
-            lot_cost = L[i] * p[i]
-            if lot_cost > cash + 1e-9:
-                continue
-            gap = t[i] - shares[i] * p[i]        # how far below target we still are
-            if gap > best_gap:
-                best_i, best_gap = i, gap
-        if best_i < 0:
-            break
-        shares[best_i] += L[best_i]
-        cash -= L[best_i] * p[best_i]
-    return shares
-
-
-def parse_holdings(text, tickers):
-    """Read a free-text list of what the user already owns.
-
-    Accepts one position per line in whatever punctuation people actually
-    type -- 'RELIANCE.NS 40', 'RELIANCE.NS, 40', 'RELIANCE.NS: 40 shares',
-    tabs from a pasted spreadsheet -- and matches tickers case-insensitively,
-    with or without the exchange suffix, so a paste from a broker statement
-    that says plain 'RELIANCE' still lands on RELIANCE.NS.
-
-    Returns (shares_by_ticker, problems). Anything unrecognised is reported
-    rather than silently dropped: a holding the app quietly ignores would
-    understate what you own and overstate what you need to buy.
-    """
-    shares, problems = {}, []
-    if not text or not str(text).strip():
-        return shares, problems
-
-    exact = {t.upper(): t for t in tickers}
-    stem = {}
-    for t in tickers:
-        stem.setdefault(t.upper().split(".")[0], t)
-
-    for raw in str(text).replace(";", "\n").splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        # A comma is both a field separator and a thousands separator, and
-        # Indian brokers export both on the same line. Strip the ones sitting
-        # between digits first, or '1,250' splits into 1 and 250 and the
-        # position silently shrinks by three orders of magnitude.
-        line = re.sub(r"(?<=\d),(?=\d{2,3}(?:\D|$))", "", line)
-        parts = [p for p in re.split(r"[\s,:|\t]+", line) if p]
-        if len(parts) < 2:
-            problems.append(f"`{line}` — need a ticker and a number of shares")
-            continue
-        sym = parts[0].upper().strip("'\"")
-        qty_txt = None
-        for p in parts[1:]:                       # first token that parses as a number
-            cleaned = p.replace(",", "").replace("_", "")
-            try:
-                float(cleaned)
-                qty_txt = cleaned
-                break
-            except ValueError:
-                continue
-        if qty_txt is None:
-            problems.append(f"`{line}` — no share count found")
-            continue
-        tick = exact.get(sym) or stem.get(sym.split(".")[0])
-        if tick is None:
-            problems.append(f"`{sym}` — not in this universe, ignored")
-            continue
-        try:
-            q = float(qty_txt)
-        except ValueError:
-            problems.append(f"`{line}` — could not read the share count")
-            continue
-        if q < 0:
-            problems.append(f"`{sym}` — negative share counts are not supported here")
-            continue
-        shares[tick] = shares.get(tick, 0.0) + q
-    return shares, problems
-
-
-def holdings_to_weights(shares_by_ticker, tickers, prices_report):
-    """Current portfolio weights from share counts and per-share prices.
-
-    `prices_report` must already be in the reporting currency. Returns
-    (weights, total_value, n_priced). Weights sum to 1 over what could be
-    priced; a name with no usable price is treated as not held rather than
-    as held at zero, and is counted out via n_priced so the caller can say so.
-    """
-    n = len(tickers)
-    vals = np.zeros(n, dtype=float)
-    n_priced = 0
-    for i, t in enumerate(tickers):
-        q = float(shares_by_ticker.get(t, 0.0) or 0.0)
-        px = prices_report[i] if i < len(prices_report) else np.nan
-        if q > 0 and pd.notna(px) and float(px) > 0:
-            vals[i] = q * float(px)
-            n_priced += 1
-    total = float(np.sum(vals))
-    if total <= 0:
-        return np.zeros(n, dtype=float), 0.0, 0
-    return vals / total, total, n_priced
-
-
-def lot_size_for(ticker):
-    """Board-lot size for markets that don't trade single shares (approximate)."""
-    t = (ticker or "").upper()
-    if t.endswith(".T"):
-        return 100      # Tokyo: 100-share units
-    if t.endswith(".HK"):
-        return 100      # Hong Kong: varies by stock; 100 is a common default
-    return 1
-
-# =========================================================
-# MARKET / INDEX UNIVERSES
-# =========================================================
-MARKETS = {
-    # ---- Asset-class universes -------------------------------------------
-    # These fix the deepest flaw in the stock universes below. Black-Litterman
-    # needs w to be THE market portfolio; a hand-picked slice of 25 large caps
-    # is not one, and picking today's most liquid names and back-testing them
-    # imports the answer (survivorship + selection bias). An ETF spanning an
-    # asset class has none of that: it existed throughout, and constituent
-    # churn is handled inside the fund. This is also the problem Black and
-    # Litterman (1992) actually wrote about — global allocation across markets,
-    # not stock selection.
-    "Global multi-asset (ETFs)": {"currency": "USD", "kind": "asset-class",
-                                 "cross_tz": True, "tickers": [
-        "SPY",    # US large cap equity
-        "IWM",    # US small cap equity
-        "EFA",    # developed ex-US equity
-        "EEM",    # emerging market equity
-        "AGG",    # US aggregate bonds
-        "TLT",    # US long treasuries
-        "IEF",    # US intermediate treasuries
-        "LQD",    # investment grade credit
-        "HYG",    # high yield credit
-        "TIP",    # inflation-linked
-        "GLD",    # gold
-        "DBC",    # broad commodities
-        "VNQ",    # US real estate
-    ]},
-    "US sectors (ETFs)": {"currency": "USD", "kind": "asset-class", "tickers": [
-        "XLK", "XLF", "XLV", "XLY", "XLP", "XLE",
-        "XLI", "XLB", "XLU", "XLRE", "XLC",
-    ]},
-    "Global equity regions (ETFs)": {"currency": "USD", "kind": "asset-class",
-                                    "cross_tz": True, "tickers": [
-        "SPY", "IWM", "EFA", "EEM", "EWJ", "EWU", "EWG", "EWY", "EWZ", "INDA", "FXI", "EWC",
-    ]},
-    "United States — S&P 500": {"currency": "USD", "tickers": [
-        "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "GOOG", "META", "TSLA", "BRK-B", "JPM",
-        "V", "MA", "UNH", "HD", "PG", "JNJ", "XOM", "CVX", "KO", "PEP",
-        "ABBV", "COST", "WMT", "BAC", "AVGO", "LLY", "MRK", "PFE", "ORCL", "CRM",
-        "ADBE", "NFLX", "AMD", "INTC", "CSCO", "TMO", "ABT", "ACN", "MCD", "NKE",
-        "DIS", "WFC", "VZ", "QCOM", "TXN", "IBM", "GE", "CAT", "BA", "GS",
-        "AMGN", "HON", "UNP", "LOW", "SBUX", "BLK", "C", "AXP", "PM", "RTX",
-        "INTU", "AMAT", "BKNG", "ISRG", "ADP", "MU", "LRCX", "GILD", "REGN", "VRTX",
-        "MDLZ", "ADI", "PANW", "KLAC", "SNPS", "CDNS", "MRVL", "ORLY", "CSX", "DE",
-        "MMM", "CB", "MO", "DUK", "SO", "PLD", "CI", "ELV", "BMY", "TJX",
-        "SPGI", "SCHW", "T", "MMC", "GM", "F", "COP", "EOG", "SLB", "NEE"]},
-    "United Kingdom — FTSE 350": {"currency": "GBP", "tickers": [
-        "SHEL.L", "AZN.L", "HSBA.L", "ULVR.L", "BP.L", "GSK.L", "RIO.L", "DGE.L",
-        "GLEN.L", "BATS.L", "LSEG.L", "REL.L", "NG.L", "VOD.L", "BARC.L", "LLOY.L",
-        "PRU.L", "TSCO.L", "AAL.L", "NWG.L", "STAN.L", "BT-A.L", "IMB.L", "CPG.L",
-        "RKT.L", "AV.L", "SSE.L", "BA.L", "LGEN.L", "ANTO.L", "NXT.L", "SGRO.L",
-        "EXPN.L", "RR.L", "HLN.L", "BNZL.L", "SN.L", "WTB.L", "III.L", "ADM.L",
-        "AHT.L", "IHG.L", "FRES.L", "SMIN.L", "PSN.L", "SVT.L", "UU.L", "WEIR.L",
-        "PSON.L", "CNA.L", "SBRY.L", "KGF.L", "HWDN.L", "BDEV.L", "LAND.L", "BLND.L",
-        "RMV.L", "ITRK.L", "MNDI.L", "DPLM.L", "HL.L", "PHNX.L", "HIK.L", "CCH.L",
-        "SDR.L", "BKG.L", "SMT.L", "TW.L", "WPP.L", "AUTO.L", "ABF.L", "CTEC.L"]},
-    "Germany — HDAX": {"currency": "EUR", "tickers": [
-        "SAP.DE", "SIE.DE", "ALV.DE", "DTE.DE", "AIR.DE", "MRK.DE", "MBG.DE", "BMW.DE",
-        "VOW3.DE", "BAS.DE", "BAYN.DE", "ADS.DE", "DBK.DE", "IFX.DE", "DB1.DE", "MUV2.DE",
-        "RWE.DE", "EOAN.DE", "DHL.DE", "HEN3.DE", "VNA.DE", "FRE.DE", "CON.DE", "DTG.DE",
-        "PAH3.DE", "SHL.DE", "ZAL.DE", "HNR1.DE", "BEI.DE", "SY1.DE", "MTX.DE", "QIA.DE",
-        "BNR.DE", "RHM.DE", "CBK.DE", "P911.DE", "HEI.DE", "FME.DE", "SRT3.DE", "PUM.DE",
-        "LHA.DE", "TKA.DE", "HFG.DE", "EVK.DE", "FRA.DE", "G24.DE", "1COV.DE", "AIXA.DE",
-        "SDF.DE", "UN01.DE", "WCH.DE", "LEG.DE", "CTS.DE", "KGX.DE", "NDA.DE", "TEG.DE"]},
-    "France — SBF 120": {"currency": "EUR", "tickers": [
-        "MC.PA", "OR.PA", "RMS.PA", "TTE.PA", "SAN.PA", "AIR.PA", "SU.PA", "AI.PA",
-        "EL.PA", "BNP.PA", "CS.PA", "DG.PA", "SAF.PA", "BN.PA", "KER.PA", "STLAP.PA",
-        "CAP.PA", "ENGI.PA", "GLE.PA", "ACA.PA", "DSY.PA", "LR.PA", "PUB.PA", "VIE.PA",
-        "ML.PA", "RI.PA", "ORA.PA", "STMPA.PA", "HO.PA", "SGO.PA", "EN.PA", "VIV.PA",
-        "CA.PA", "BVI.PA", "RNO.PA", "EDEN.PA", "ERF.PA", "SW.PA", "TEP.PA", "ALO.PA",
-        "FR.PA", "AKE.PA", "FDJ.PA", "GET.PA", "COFA.PA", "RXL.PA", "SOI.PA", "AMUN.PA"]},
-    "Japan — Nikkei 225": {"currency": "JPY", "tickers": [
-        "7203.T", "6758.T", "6861.T", "8306.T", "9984.T", "6098.T", "9432.T", "7974.T",
-        "8035.T", "6501.T", "4063.T", "6902.T", "8058.T", "8316.T", "4568.T", "9433.T",
-        "6367.T", "7267.T", "6594.T", "8001.T", "4519.T", "6981.T", "8031.T", "7741.T",
-        "6273.T", "9434.T", "6752.T", "6503.T", "7751.T", "8766.T", "8411.T", "8802.T",
-        "4661.T", "9022.T", "2914.T", "4502.T", "6301.T", "7011.T", "6702.T", "4901.T",
-        "6326.T", "5108.T", "8053.T", "6954.T", "7269.T", "7201.T", "6971.T", "4543.T",
-        "4523.T", "6857.T", "7735.T", "4578.T", "9020.T", "9101.T", "5401.T", "3382.T",
-        "9983.T", "8267.T", "4452.T", "2802.T", "4507.T", "7013.T", "5020.T", "8604.T",
-        "8750.T", "9501.T", "9531.T", "6146.T", "4689.T"]},
-    "India — Nifty 500": {"currency": "INR", "tickers": [
-        "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "ICICIBANK.NS", "INFY.NS", "HINDUNILVR.NS",
-        "BHARTIARTL.NS", "ITC.NS", "SBIN.NS", "LT.NS", "KOTAKBANK.NS", "AXISBANK.NS",
-        "BAJFINANCE.NS", "ASIANPAINT.NS", "MARUTI.NS", "HCLTECH.NS", "SUNPHARMA.NS",
-        "TITAN.NS", "WIPRO.NS", "ULTRACEMCO.NS", "NESTLEIND.NS", "TATAMOTORS.NS",
-        "TATASTEEL.NS", "POWERGRID.NS", "NTPC.NS", "BAJAJFINSV.NS", "ADANIENT.NS",
-        "ADANIPORTS.NS", "COALINDIA.NS", "JSWSTEEL.NS", "HINDALCO.NS", "GRASIM.NS",
-        "TECHM.NS", "ONGC.NS", "BPCL.NS", "DRREDDY.NS", "CIPLA.NS", "DIVISLAB.NS",
-        "BRITANNIA.NS", "EICHERMOT.NS", "HEROMOTOCO.NS", "BAJAJ-AUTO.NS", "INDUSINDBK.NS",
-        "APOLLOHOSP.NS", "TATACONSUM.NS", "HDFCLIFE.NS", "SBILIFE.NS", "LTIM.NS",
-        "M&M.NS", "SHRIRAMFIN.NS", "ADANIGREEN.NS", "DMART.NS", "PIDILITIND.NS",
-        "GODREJCP.NS", "DABUR.NS", "HAVELLS.NS", "SIEMENS.NS", "BOSCHLTD.NS", "ABB.NS",
-        "VEDL.NS", "AMBUJACEM.NS", "SHREECEM.NS", "BANKBARODA.NS", "PNB.NS", "CANBK.NS",
-        "GAIL.NS", "IOC.NS", "DLF.NS", "TRENT.NS", "NAUKRI.NS", "INDIGO.NS",
-        "MARICO.NS", "COLPAL.NS", "BERGEPAINT.NS", "ICICIPRULI.NS", "ICICIGI.NS",
-        "MUTHOOTFIN.NS", "CHOLAFIN.NS", "TVSMOTOR.NS", "SRF.NS", "UPL.NS",
-        "AUROPHARMA.NS", "LUPIN.NS", "TORNTPHARM.NS", "MPHASIS.NS", "PERSISTENT.NS"]},
-    "Canada — S&P/TSX Composite": {"currency": "CAD", "tickers": [
-        "RY.TO", "TD.TO", "ENB.TO", "CNQ.TO", "BNS.TO", "BMO.TO", "CP.TO", "CNR.TO",
-        "TRP.TO", "SU.TO", "BCE.TO", "MFC.TO", "ATD.TO", "CM.TO", "SHOP.TO", "SLF.TO",
-        "TRI.TO", "NTR.TO", "GIB-A.TO", "WCN.TO", "NA.TO", "IMO.TO", "PPL.TO", "FTS.TO",
-        "WPM.TO", "AEM.TO", "ABX.TO", "POW.TO", "MG.TO", "CVE.TO", "T.TO", "BAM.TO",
-        "CCO.TO", "DOL.TO", "L.TO", "QSR.TO", "MRU.TO", "SAP.TO", "TECK-B.TO", "FNV.TO",
-        "GIL.TO", "CTC-A.TO", "WN.TO", "EMA.TO", "H.TO", "FM.TO", "IFC.TO", "OTEX.TO",
-        "CSU.TO", "AGI.TO", "NPI.TO", "STN.TO", "TOU.TO", "ARX.TO", "KEY.TO", "CAE.TO"]},
-    "Australia — S&P/ASX 200": {"currency": "AUD", "tickers": [
-        "BHP.AX", "CBA.AX", "CSL.AX", "NAB.AX", "WBC.AX", "ANZ.AX", "WES.AX", "MQG.AX",
-        "FMG.AX", "WOW.AX", "TLS.AX", "RIO.AX", "GMG.AX", "TCL.AX", "WDS.AX", "ALL.AX",
-        "COL.AX", "STO.AX", "QBE.AX", "REA.AX", "ORG.AX", "SUN.AX", "AMC.AX", "RMD.AX",
-        "JHX.AX", "COH.AX", "BXB.AX", "SCG.AX", "S32.AX", "IAG.AX", "MPL.AX", "ASX.AX",
-        "XRO.AX", "WTC.AX", "PLS.AX", "NST.AX", "TWE.AX", "CPU.AX", "SGP.AX", "GPT.AX",
-        "MGR.AX", "SHL.AX", "RHC.AX", "ALD.AX", "ORI.AX", "AGL.AX", "APA.AX", "SEK.AX",
-        "CAR.AX", "REH.AX", "MIN.AX", "PME.AX", "EDV.AX", "QAN.AX", "BSL.AX", "JBH.AX",
-        "SOL.AX", "IGO.AX", "LYC.AX", "WHC.AX", "VCX.AX", "BEN.AX", "BOQ.AX", "FPH.AX"]},
-    "Hong Kong — Hang Seng Composite": {"currency": "HKD", "tickers": [
-        "0700.HK", "9988.HK", "0939.HK", "1299.HK", "0941.HK", "3690.HK", "1810.HK",
-        "0388.HK", "2318.HK", "0005.HK", "1398.HK", "0883.HK", "2628.HK", "0016.HK",
-        "1211.HK", "0011.HK", "0002.HK", "0003.HK", "0001.HK", "0027.HK", "0175.HK",
-        "1024.HK", "9618.HK", "9999.HK", "2020.HK", "2331.HK", "0669.HK", "1113.HK",
-        "0288.HK", "0386.HK", "3968.HK", "0688.HK", "2688.HK", "1109.HK", "0762.HK",
-        "0857.HK", "1088.HK", "2382.HK", "0968.HK", "2015.HK", "9868.HK", "3888.HK",
-        "0981.HK", "1177.HK", "2269.HK", "0291.HK", "2319.HK", "1093.HK", "6690.HK",
-        "0316.HK", "1928.HK", "0012.HK", "0006.HK", "0066.HK", "0017.HK", "1044.HK"]},
-}
-
-# =========================================================
-# DATA DOWNLOAD
-# =========================================================
-def _download_batch(tickers, start, end, interval="1d"):
-    raw = yf.download(tickers=list(tickers), start=start, end=end, interval=interval,
-                      auto_adjust=True, progress=False, group_by="column")
-    if raw is None or raw.empty:
-        return pd.DataFrame(), pd.DataFrame()
-
-    def _extract(field):
-        if isinstance(raw.columns, pd.MultiIndex):
-            if field in raw.columns.get_level_values(0):
-                out = raw[field].copy()
-            else:
-                return pd.DataFrame()
-        else:
-            if field in raw.columns:
-                out = raw[[field]].copy()
-                if len(tickers) == 1:
-                    out.columns = [tickers[0]]
-            else:
-                return pd.DataFrame()
-        if isinstance(out, pd.Series):
-            out = out.to_frame(name=tickers[0])
-        if isinstance(out.columns, pd.MultiIndex):
-            out.columns = out.columns.get_level_values(-1)
-        return out
-
-    return _extract("Close"), _extract("Volume")
-
-
-@st.cache_data(show_spinner=False)
-def download_prices_volume(tickers, start, end, retries=2, interval="1d"):
-    """Download close+volume, retrying tickers that come back empty (recovers
-    transient Yahoo rate-limit / hiccup failures rather than treating them as
-    delisted). Genuinely unavailable symbols are simply left out.
-
-    `interval` matters for speed: the yearly horizon works in weekly returns, so
-    pulling 15 years of DAILY bars for ~100 symbols downloads and parses five
-    times more data than it can ever use."""
-    close, volume = _download_batch(tickers, start, end, interval)
-
-    def _missing(cl):
-        done = set(cl.columns) if not cl.empty else set()
-        good = {c for c in done if not cl[c].dropna().empty}
-        return [t for t in tickers if t not in good]
-
-    missing = _missing(close)
-    for _ in range(retries):
-        if not missing:
-            break
-        c2, v2 = _download_batch(missing, start, end, interval)
-        if not c2.empty:
-            for col in c2.columns:
-                close[col] = c2[col]
-            if not v2.empty:
-                for col in v2.columns:
-                    volume[col] = v2[col]
-        missing = _missing(close)
-
-    if not close.empty:
-        close = close.dropna(how="all")
-    return close, volume
-
-
-@st.cache_data(show_spinner=False)
-def get_series_close(ticker, start, end):
-    """Download a single symbol's adjusted close as a Series (for index / FX)."""
-    try:
-        raw = yf.download(ticker, start=start, end=end, auto_adjust=True,
-                          progress=False, group_by="column")
-        if raw is None or raw.empty:
-            return None
-        if isinstance(raw.columns, pd.MultiIndex):
-            if "Close" not in raw.columns.get_level_values(0):
-                return None
-            s = raw["Close"]
-            if isinstance(s, pd.DataFrame):
-                s = s.iloc[:, 0]
-        else:
-            if "Close" not in raw.columns:
-                return None
-            s = raw["Close"]
-        return s.dropna()
-    except Exception:
-        return None
-
-
-@st.cache_data(show_spinner=False)
-def get_fx_series(native, report, start, end):
-    """Time series of (report per native) FX rate; None if same currency/unavailable."""
-    native = (native or "").upper().strip()
-    report = (report or "").upper().strip()
-    if not native or not report or native == report:
-        return None
-    s = get_series_close(f"{native}{report}=X", start, end)
-    if s is not None and not s.empty:
-        return s
-    inv = get_series_close(f"{report}{native}=X", start, end)
-    if inv is not None and not inv.empty:
-        return 1.0 / inv
-    return None
-
-
-def rank_by_liquidity(close, volume, top_n):
-    if close.empty:
-        return []
-    if volume is None or volume.empty:
-        return close.count().sort_values(ascending=False).head(top_n).index.tolist()
-    common = [c for c in close.columns if c in volume.columns]
-    dv = (close[common] * volume[common]).median(axis=0, skipna=True)
-    dv = dv.replace([np.inf, -np.inf], np.nan).dropna().sort_values(ascending=False)
-    return dv.head(top_n).index.tolist()
-
-
-@st.cache_data(show_spinner=False)
-def get_market_caps(tickers):
-    """Size of each holding, for the market portfolio the prior is built from.
-
-    For a company that is market capitalisation. For a FUND there is no market
-    cap, so we fall back to net assets (AUM) — and that distinction matters more
-    than it sounds. The obvious alternative, traded value, is badly wrong for
-    ETFs: SPY turns over roughly eighty times more dollars per day than AGG,
-    yet the US bond market is larger than the US equity market. Sizing an
-    asset-class prior by volume produces a "market portfolio" that is 64% SPY
-    and 15% bonds, which is not the market by any definition.
-    """
-    def _one(t):
-        mc = None
-        try:
-            fi = yf.Ticker(t).fast_info
-            if fi:
-                mc = fi.get("market_cap") or fi.get("marketCap")
-        except Exception:
-            mc = None
-        if not mc:
-            # Funds have no market cap, so fall back to net assets. This hits
-            # .info, which is an order of magnitude slower than fast_info — for
-            # an ETF universe that is EVERY symbol, so it must not run serially.
-            try:
-                info = yf.Ticker(t).info or {}
-                mc = (info.get("totalAssets") or info.get("netAssets")
-                      or info.get("totalAsset") or None)
-            except Exception:
-                mc = None
-        try:
-            return t, (float(mc) if mc else np.nan)
-        except (TypeError, ValueError):
-            return t, np.nan
-
-    tickers = list(tickers)
-    caps = {}
-    # These are network-bound, so threads help enormously and cost nothing.
-    # Serial, an ETF universe took the better part of a minute here.
-    try:
-        with ThreadPoolExecutor(max_workers=min(12, max(1, len(tickers)))) as ex:
-            for t, v in ex.map(_one, tickers):
-                caps[t] = v
-    except Exception:
-        for t in tickers:
-            k, v = _one(t)
-            caps[k] = v
-    return caps
-
-
-@st.cache_data(show_spinner=False)
-def get_current_prices(tickers):
-    """Latest available market price per ticker (live, one batched download)."""
-    tickers = list(tickers)
-    try:
-        raw = yf.download(tickers, period="5d", auto_adjust=True, progress=False, group_by="column")
-    except Exception:
-        return {}
-    if raw is None or raw.empty:
-        return {}
-    if isinstance(raw.columns, pd.MultiIndex):
-        if "Close" not in raw.columns.get_level_values(0):
-            return {}
-        close = raw["Close"]
-    else:
-        if "Close" not in raw.columns:
-            return {}
-        close = raw[["Close"]]
-        if len(tickers) == 1:
-            close.columns = [tickers[0]]
-    out = {}
-    for t in tickers:
-        try:
-            s = close[t].dropna() if t in close.columns else pd.Series(dtype=float)
-            out[t] = float(s.iloc[-1]) if len(s) else np.nan
-        except Exception:
-            out[t] = np.nan
-    return out
-
-# =========================================================
-# RETURNS
-# =========================================================
-def to_returns(prices, freq, use_log):
-    rule = FREQ_RULE[freq]
-    px = prices if rule is None else prices.resample(rule).last()
-    px = px.dropna(how="all")
-    r = np.log(px).diff() if use_log else px.pct_change()
-    return r.dropna()
-
-# =========================================================
-# COVARIANCE ESTIMATORS  (return ANNUALISED matrices)
-# =========================================================
-def nearest_psd(matrix, eps=1e-10):
-    matrix = (matrix + matrix.T) / 2.0
-    vals, vecs = np.linalg.eigh(matrix)
-    vals = np.maximum(vals, eps)
-    return vecs @ np.diag(vals) @ vecs.T
-
-
-def ledoit_wolf_identity(X):
-    """Ledoit-Wolf (2004) shrinkage of the sample covariance toward a scaled
-    identity. X is a T x N matrix of (periodic) returns. Returns periodic cov."""
-    X = np.asarray(X, dtype=float)
-    t, n = X.shape
-    Xc = X - X.mean(axis=0, keepdims=True)
-    S = (Xc.T @ Xc) / t
-    m = np.trace(S) / n
-    d2 = np.sum((S - m * np.eye(n)) ** 2) / n
-
-    # The textbook form of b_bar2 loops over every observation, building an
-    # n x n outer product each time. With 15 years of daily data that is ~3,800
-    # Python iterations per call, and a walk-forward backtest calls this once
-    # per rebalance on an expanding window — twelve seconds of a fifteen-second
-    # backtest went here. Expanding the Frobenius norm removes the loop:
-    #
-    #   sum_i ||x_i x_i' - S||_F^2
-    #     = sum_i (x_i'x_i)^2  -  2 sum_i x_i' S x_i  +  t ||S||_F^2
-    #
-    # which is three vectorised reductions. Algebraically identical, no
-    # approximation — verified against the loop to machine precision by a test.
-    sq = np.einsum("ij,ij->i", Xc, Xc)              # ||x_i||^2 for each i
-    term1 = float(np.dot(sq, sq))                   # sum_i (x_i'x_i)^2
-    term2 = float(np.sum((Xc @ S) * Xc))            # sum_i x_i' S x_i
-    term3 = t * float(np.sum(S * S))                # t ||S||_F^2
-    b_bar2 = (term1 - 2.0 * term2 + term3) / (t ** 2) / n
-    b2 = min(b_bar2, d2)
-    a2 = d2 - b2
-    shrink = b2 / d2 if d2 > 0 else 1.0
-    sigma = shrink * m * np.eye(n) + (a2 / d2 if d2 > 0 else 0.0) * S
-    return sigma
-
-
-def _ewma_weights(t, halflife):
-    lam = 0.5 ** (1.0 / max(halflife, 1e-9))
-    w = lam ** np.arange(t - 1, -1, -1)
-    return w / w.sum()
-
-
-def horizon_returns(returns, h):
-    """Overlapping h-period compounded returns from a period-return panel.
-
-    Row k is the return between the price at k and the price at k + h, i.e. it
-    compounds periods k+1 through k+h. The output therefore has len(R) - h rows,
-    one per window that fully fits inside the sample.
-    """
-    R = np.asarray(returns, dtype=float)
-    h = max(1, int(h))
-    if h == 1 or len(R) <= h:
-        return R
-    g = np.cumprod(1.0 + R, axis=0)
-    return g[h:] / g[:-h] - 1.0
-
-
-def variance_ratio(returns, h, shrink_c=10.0, lo=0.25, hi=4.0):
-    """Per-asset variance ratio VR(h) = Var(h-period) / (h x Var(1-period)).
-
-    The whole reason a holding period should change a portfolio. Scaling daily
-    variance by h assumes returns are independent from one day to the next. They
-    are not: an asset that mean-reverts is LESS risky over a year than its daily
-    volatility implies (VR < 1) and deserves more weight in a long hold, while a
-    trending one is MORE risky (VR > 1) and deserves less. Under strict i.i.d.
-    returns VR = 1 at every horizon and the holding period genuinely does not
-    matter -- which is why the app used to give the same answer for a week and a
-    year.
-
-    Overlapping windows mean the estimate is far noisier than the raw sample
-    size suggests: 3,780 daily observations contain only ~15 independent annual
-    ones. So VR is shrunk toward 1 by the effective sample count, which leaves a
-    weekly horizon essentially untouched and pulls a yearly one most of the way
-    back unless the evidence is strong. Clipped to [lo, hi] so a single freak
-    window cannot rescale a book.
-    """
-    R = np.asarray(returns, dtype=float)
-    h = max(1, int(h))
-    if R.ndim == 1:
-        R = R[:, None]
-    n = R.shape[1]
-    if h == 1 or len(R) <= 2 * h:
-        return np.ones(n)
-    var1 = np.var(R, axis=0, ddof=1)
-    Rh = horizon_returns(R, h)
-    if len(Rh) < 3:
-        return np.ones(n)
-    varh = np.var(Rh, axis=0, ddof=1)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        vr = np.where(var1 > 1e-18, varh / (h * var1), 1.0)
-    vr = np.where(np.isfinite(vr), vr, 1.0)
-    # Effective independent observations at this horizon, not the overlapping count.
-    n_eff = len(R) / float(h)
-    k = n_eff / (n_eff + float(shrink_c))
-    vr = 1.0 + (vr - 1.0) * k
-    return np.clip(vr, lo, hi)
-
-
-def apply_variance_ratio(cov_annual, vr):
-    """Rescale each asset's variance by its variance ratio, keeping correlations.
-
-    Correlations are estimated well from daily data and badly from a handful of
-    overlapping annual windows, so only the volatilities are re-scaled here.
-    That is a deliberate compromise and the reason it is stated in the app.
-    """
-    S = np.asarray(cov_annual, dtype=float)
-    d = np.sqrt(np.clip(np.asarray(vr, dtype=float), 1e-12, None))
-    return nearest_psd(S * np.outer(d, d))
-
-
-def estimate_cov(returns, method, freq_per_year):
-    R = returns.values
-    t = R.shape[0]
-    if method == "Ledoit-Wolf shrinkage":
-        cov_p = ledoit_wolf_identity(R)
-    elif method == "Exponentially weighted":
-        hl = max(t / 3.0, 5)
-        w = _ewma_weights(t, hl)
-        mu = np.average(R, axis=0, weights=w)
-        Xc = R - mu
-        cov_p = (Xc * w[:, None]).T @ Xc
-    else:  # Sample
-        cov_p = np.cov(R, rowvar=False)
-    cov_annual = nearest_psd(np.atleast_2d(cov_p) * freq_per_year)
-    return pd.DataFrame(cov_annual, index=returns.columns, columns=returns.columns)
-
-# =========================================================
-# EXPECTED-RETURN ESTIMATORS  (return ANNUALISED Series)
-# =========================================================
-def estimate_mu(returns, method, freq_per_year, rf, cov_annual=None, market_caps=None):
-    cols = list(returns.columns)
-    R = returns.values
-    t, n = R.shape
-    hist = returns.mean().values * freq_per_year  # annual historical mean
-
-    if method == "Exponentially weighted":
-        w = _ewma_weights(t, max(t / 3.0, 5))
-        mu = np.average(R, axis=0, weights=w) * freq_per_year
-    elif method == "James-Stein shrinkage":
-        grand = float(np.mean(hist))
-        denom = float(np.sum((hist - grand) ** 2))
-        if cov_annual is not None:
-            avg_var = float(np.mean(np.diag(np.asarray(cov_annual)))) / max(t, 1)
-        else:
-            avg_var = float(np.var(hist)) / max(t, 1)
-        c = 0.0 if denom <= 0 else min(1.0, max(0.0, (n - 2) * avg_var / denom))
-        mu = grand + (1.0 - c) * (hist - grand)
-    elif method == "CAPM equilibrium":
-        Sigma = np.asarray(cov_annual, dtype=float)
-        if market_caps is not None:
-            caps = np.array([market_caps.get(t_, np.nan) for t_ in cols], dtype=float)
-        else:
-            caps = np.full(n, np.nan)
-        if np.all(np.isfinite(caps)) and np.nansum(caps) > 0:
-            w_mkt = caps / np.nansum(caps)
-        else:
-            w_mkt = np.repeat(1.0 / n, n)
-        mkt_ret = float(w_mkt @ hist)
-        mkt_var = float(w_mkt @ Sigma @ w_mkt)
-        delta = (mkt_ret - rf) / mkt_var if mkt_var > 0 else 2.5
-        if not np.isfinite(delta) or delta <= 0:
-            delta = 2.5
-        mu = rf + delta * (Sigma @ w_mkt)
-    else:  # Historical mean
-        mu = hist
-    return pd.Series(mu, index=cols)
-
-
-# =========================================================
-# BLACK-LITTERMAN CORE
-# =========================================================
-# Everything in this block works in EXCESS-return space (returns over the
-# risk-free rate), because that is the space the equilibrium is defined in:
-#   pi = delta * Sigma * w_mkt   is an excess return by construction.
-# Total returns are recovered at the very end as  mu_total = rf + mu_excess.
-# Getting this wrong is the single most common Black-Litterman bug: it silently
-# shifts every view by the risk-free rate.
-
-VIEW_TYPES = ["Absolute", "Relative"]
-
-def _scalar(x):
-    """float() on a 1-element array is an error in NumPy 2.x — this keeps the
-    matrix algebra below readable without sprinkling .item() everywhere."""
-    return float(np.asarray(x).reshape(-1)[0])
-
-
-
-def market_weights(tickers, caps, fallback_weights=None):
-    """The market portfolio: cap-weighted where caps are available.
-
-    Yahoo does not return a market cap for every symbol (and never for an ETF
-    or an index). Rather than silently falling back to equal weight — which
-    would quietly destroy the whole point of the equilibrium prior — we fill a
-    small number of gaps with the median cap, and only abandon cap weighting
-    when most of the universe is missing. The note we return is shown in the UI
-    so the user always knows which prior they actually got.
-    """
-    caps = caps or {}
-    n = len(tickers)
-    v = np.array([caps.get(t, np.nan) for t in tickers], dtype=float)
-    v = np.where(np.isfinite(v) & (v > 0), v, np.nan)
-    ok = np.isfinite(v)
-
-    if ok.sum() >= max(2, int(math.ceil(0.6 * n))) and np.nansum(v) > 0:
-        n_missing = int((~ok).sum())
-        v = np.where(ok, v, np.nanmedian(v[ok]))
-        w = v / v.sum()
-        note = "market capitalisation"
-        if n_missing:
-            note += f" ({n_missing} missing cap{'s' if n_missing > 1 else ''} filled with the median)"
-        return w, note
-
-    if fallback_weights is not None:
-        fb = np.asarray(fallback_weights, dtype=float)
-        if np.all(np.isfinite(fb)) and fb.sum() > 0:
-            # Last resort, and a poor one — volume is not size. Flagged loudly
-            # in the UI because a prior built this way is not an equilibrium.
-            return fb / fb.sum(), "traded value (sizes unavailable — see warning)"
-
-    return np.repeat(1.0 / n, n), "equal weight (market caps unavailable)"
-
-
-def implied_risk_aversion(w_mkt, Sigma, mkt_excess_return):
-    """delta = (E[r_mkt] - rf) / var(r_mkt) — the market's price of risk.
-
-    Clamped to [0.5, 10]: a market whose realised excess return over the sample
-    was near zero or negative produces a delta that is meaningless (or negative,
-    which flips the sign of every equilibrium return).
-    """
-    Sigma = np.asarray(Sigma, dtype=float)
-    w_mkt = np.asarray(w_mkt, dtype=float)
-    var = float(w_mkt @ Sigma @ w_mkt)
-    if var <= 0 or not np.isfinite(mkt_excess_return):
-        return 2.5, "default 2.5 — market variance unavailable"
-    d = float(mkt_excess_return) / var
-    if not np.isfinite(d) or d <= 0:
-        return 2.5, ("default 2.5 — the market portfolio's realised excess return over this "
-                     "window was not positive, so the implied value is unusable")
-    if d < 0.5 or d > 10.0:
-        cl = float(np.clip(d, 0.5, 10.0))
-        return cl, f"implied value {d:,.2f} clamped to {cl:,.2f}"
-    return d, "implied from the cap-weighted market portfolio"
-
-
-def equilibrium_returns(delta, Sigma, w_mkt):
-    """Reverse optimisation: pi = delta * Sigma * w_mkt.
-
-    This is the whole trick of Black-Litterman. Instead of asking 'what returns
-    do I forecast?' (noisy, and the optimiser will amplify the noise), we ask
-    'what returns would make today's market portfolio optimal?' and treat that
-    as the prior. Returned as EXCESS returns.
-    """
-    return float(delta) * (np.asarray(Sigma, dtype=float) @ np.asarray(w_mkt, dtype=float))
-
-
-def implied_confidence_weights(mu_excess, Sigma, delta):
-    """Unconstrained optimal weights for a given excess-return vector:
-    w = (delta * Sigma)^-1 * mu.  Note w = w_mkt exactly when mu = pi."""
-    Sigma = np.asarray(Sigma, dtype=float)
-    try:
-        return np.linalg.solve(delta * Sigma, np.asarray(mu_excess, dtype=float))
-    except np.linalg.LinAlgError:
-        return np.linalg.pinv(delta * Sigma) @ np.asarray(mu_excess, dtype=float)
-
-
-# ---------------------------------------------------------
-# Views  ->  P (picking matrix), Q (view returns), confidences
-# ---------------------------------------------------------
-def blank_views(tickers, n_rows=3):
-    """Empty views grid, sized to the loaded universe."""
-    first = tickers[0] if tickers else ""
-    second = tickers[1] if len(tickers) > 1 else first
-    return pd.DataFrame({
-        "Use": [False] * n_rows,
-        "Type": ["Absolute"] * n_rows,
-        "Asset": [first] * n_rows,
-        "Versus": [second] * n_rows,
-        "Return % p.a.": [0.0] * n_rows,
-        "Confidence %": [DEFAULT_VIEW_CONFIDENCE] * n_rows,
-    })
-
-
-def build_pq(views_df, tickers, rf):
-    """Turn the editable views table into (P, Q, confidences, labels, errors).
-
-    Q is returned in EXCESS space:
-      - an ABSOLUTE view ('AAPL will return 12%') is a total return, so we
-        subtract rf to compare it with pi;
-      - a RELATIVE view ('AAPL beats MSFT by 3%') is a difference, so the
-        risk-free rate cancels and nothing is subtracted.
-    """
-    idx = {t: i for i, t in enumerate(tickers)}
-    n = len(tickers)
-    P, Q, conf, labels, errors = [], [], [], [], []
-
-    if views_df is None or len(views_df) == 0:
-        return (np.zeros((0, n)), np.zeros(0), np.zeros(0), [], [])
-
-    for pos, (_, row) in enumerate(views_df.iterrows(), start=1):
-        try:
-            use = bool(row.get("Use", False))
-        except Exception:
-            use = False
-        if not use:
-            continue
-
-        vtype = str(row.get("Type", "Absolute") or "Absolute").strip()
-        asset = str(row.get("Asset", "") or "").strip()
-        versus = str(row.get("Versus", "") or "").strip()
-
-        raw_q = row.get("Return % p.a.", None)
-        raw_c = row.get("Confidence %", None)
-        # A blank cell in st.data_editor arrives as NaN, not None, so float()
-        # succeeds and silently produces a NaN view. Check explicitly.
-        try:
-            q = float(raw_q) / 100.0
-        except (TypeError, ValueError):
-            q = np.nan
-        if not np.isfinite(q):
-            errors.append(f"View {pos}: '{raw_q}' is not a valid expected return — row skipped.")
-            continue
-        try:
-            c = float(raw_c) / 100.0
-        except (TypeError, ValueError):
-            c = np.nan
-        if not np.isfinite(c):
-            errors.append(f"View {pos}: '{raw_c}' is not a valid confidence — row skipped.")
-            continue
-
-        if asset not in idx:
-            errors.append(f"View {pos}: '{asset}' is not in the loaded universe — row skipped.")
-            continue
-        if c <= 0:
-            errors.append(f"View {pos}: confidence is 0%, which means 'ignore this view' — row skipped.")
-            continue
-        c = min(c, 0.9999)
-
-        p = np.zeros(n)
-        if vtype == "Relative":
-            if versus not in idx:
-                errors.append(f"View {pos}: '{versus}' is not in the loaded universe — row skipped.")
-                continue
-            if versus == asset:
-                errors.append(f"View {pos}: a relative view against itself is empty — row skipped.")
-                continue
-            p[idx[asset]] = 1.0
-            p[idx[versus]] = -1.0
-            labels.append(f"{asset} outperforms {versus} by {q*100:,.2f}%")
-            Q.append(q)                    # rf cancels in a difference
-        else:
-            p[idx[asset]] = 1.0
-            labels.append(f"{asset} returns {q*100:,.2f}% p.a.")
-            Q.append(q - rf)               # total -> excess
-
-        P.append(p)
-        conf.append(c)
-
-    if not P:
-        return (np.zeros((0, n)), np.zeros(0), np.zeros(0), [], errors)
-    return (np.array(P), np.array(Q), np.array(conf), labels, errors)
-
-
-# ---------------------------------------------------------
-# Omega — how uncertain each view is
-# ---------------------------------------------------------
-# =========================================================
-# SYSTEMATIC VIEW ENGINES
-# =========================================================
-# Typed views cannot be tested. You form them today, so applying them to 2022
-# is look-ahead bias — which is why the backtest can only ever run views-off.
-# A RULE can be evaluated at every rebalance using only the data available at
-# that moment, so the backtest can finally answer the question that matters:
-# do views add anything at all?
-#
-# Every engine here is a pure function of a price history. Give it prices up to
-# time t and it returns views as of time t. Nothing else. That property is what
-# makes the whole thing honest, and it is enforced by a test.
-
-VIEW_ENGINES = {
-    "None — pure equilibrium": None,
-    "Momentum (12-1)": "momentum",
-    "Short-term reversal (1m)": "reversal",
-    "Trend (price vs 200d)": "trend",
-    "Low volatility": "lowvol",
-}
-
-ENGINE_NOTES = {
-    "momentum": ("Ranks assets on their return over the past 12 months, skipping the most "
-                 "recent month (the skip avoids short-term reversal contaminating the signal). "
-                 "Expects past winners to keep beating past losers. The most robust anomaly in "
-                 "the literature, and also among the most crowded."),
-    "reversal": ("Ranks on the last month's return and bets the other way — recent losers "
-                 "bounce. Works at short horizons where momentum does not, and is the reason "
-                 "momentum skips the most recent month."),
-    "trend": ("Compares each asset's price to its own 200-day average. Above = hold, below = "
-              "expect weakness. A time-series signal rather than a cross-sectional one: it can "
-              "be bearish on everything at once."),
-    "lowvol": ("Ranks on realised volatility and expects the calmer assets to deliver better "
-               "risk-adjusted returns — the low-volatility anomaly. Note this partly duplicates "
-               "what the optimiser already does, so its views often add little."),
-}
-
-
-def _engine_scores(prices, engine, freq_per_year):
-    """Per-asset attractiveness score from price history alone. Higher = more attractive.
-
-    `prices` must contain ONLY data the model is allowed to see at this point.
-    Returns (scores, ok) where ok is False when there is not enough history.
-    """
-    px = prices.dropna(how="all")
-    n_obs = len(px)
-    per_month = max(1, int(round(freq_per_year / 12)))
-    if n_obs < 3 * per_month:
-        return None, False
-
-    if engine == "momentum":
-        look = min(n_obs - 1, 12 * per_month)
-        skip = per_month
-        if look - skip < per_month:
-            return None, False
-        s = px.iloc[-1 - skip] / px.iloc[-look] - 1.0
-    elif engine == "reversal":
-        look = min(n_obs - 1, per_month)
-        s = -(px.iloc[-1] / px.iloc[-1 - look] - 1.0)          # negative: losers score high
-    elif engine == "trend":
-        win = min(n_obs, max(20, int(round(freq_per_year * 200 / 252))))
-        ma = px.iloc[-win:].mean()
-        s = px.iloc[-1] / ma - 1.0
-    elif engine == "lowvol":
-        win = min(n_obs - 1, 6 * per_month)
-        r = px.iloc[-(win + 1):].pct_change().dropna()
-        if len(r) < 5:
-            return None, False
-        s = -(r.std(ddof=1) * math.sqrt(freq_per_year))         # negative: calm scores high
-    else:
-        return None, False
-
-    s = s.replace([np.inf, -np.inf], np.nan).dropna()
-    if len(s) < 2:
-        return None, False
-    return s, True
-
-
-def systematic_views(prices, tickers, engine, freq_per_year, n_pairs=2,
-                     damping=0.30, max_spread=0.20, conf=None):
-    """Build (P, Q, conf, labels) from a rule, using only `prices`.
-
-    Cross-sectional engines (momentum, reversal, lowvol) produce RELATIVE views
-    pairing the best-ranked asset against the worst. `trend` produces ABSOLUTE
-    views on the strongest and weakest names, because it is a time-series signal
-    and can legitimately be negative on everything at once.
-
-    Q is damped: the raw spread between winners and losers is a backward-looking
-    number and taking it at face value would be absurdly aggressive. `damping`
-    scales it down and `max_spread` caps it.
-    """
-    n = len(tickers)
-    empty = (np.zeros((0, n)), np.zeros(0), np.zeros(0), [])
-    if engine is None:
-        return empty
-
-    scores, ok = _engine_scores(prices[tickers], engine, freq_per_year)
-    if not ok:
-        return empty
-
-    order = scores.sort_values(ascending=False)
-    names = list(order.index)
-    idx = {t: i for i, t in enumerate(tickers)}
-    k = min(int(n_pairs), len(names) // 2)
-    if k < 1:
-        return empty
-
-    P, Q, labels = [], [], []
-    for j in range(k):
-        win, lose = names[j], names[-(j + 1)]
-        if win == lose:
-            continue
-        raw = float(order.iloc[j] - order.iloc[-(j + 1)])
-        q = float(np.clip(raw * damping, -max_spread, max_spread))
-        if abs(q) < 1e-6:
-            continue
-        if engine == "trend":
-            # absolute views: the strongest gets a positive tilt, the weakest a
-            # negative one, both relative to the risk-free rate (excess space).
-            p_up = np.zeros(n); p_up[idx[win]] = 1.0
-            P.append(p_up); Q.append(abs(q) * 0.5)
-            labels.append(f"{win} above its 200d average — expect +{abs(q)*50:,.2f}% excess")
-            p_dn = np.zeros(n); p_dn[idx[lose]] = 1.0
-            P.append(p_dn); Q.append(-abs(q) * 0.5)
-            labels.append(f"{lose} below its 200d average — expect {-abs(q)*50:,.2f}% excess")
-        else:
-            p = np.zeros(n); p[idx[win]] = 1.0; p[idx[lose]] = -1.0
-            P.append(p); Q.append(q)
-            labels.append(f"{win} outperforms {lose} by {q*100:,.2f}% [{engine}]")
-
-    if not P:
-        return empty
-    c = 0.5 if conf is None else float(conf)
-    return (np.array(P), np.array(Q), np.full(len(P), c), labels)
-
-
-def engine_hit_rate(prices, engine, freq_per_year, holding_periods,
-                    n_pairs=2, max_checks=60):
-    """How often has this rule been directionally right, out of sample?
-
-    Walks forward through the history: at each step, form the view using only
-    prices up to that point, then check the SIGN of what actually happened over
-    the following `holding_periods`. Never looks beyond the point being tested.
-
-    Returns (hit_rate, n_checks). A rule with no information lands at 0.5.
-    """
-    px = prices.dropna(how="all")
-    T = len(px)
-    hp = max(1, int(holding_periods))
-    per_month = max(1, int(round(freq_per_year / 12)))
-    warm = 13 * per_month                      # momentum needs 12m + 1m skip
-    if T < warm + hp + 5:
-        return None, 0
-
-    step = max(hp, (T - warm - hp) // max_checks + 1)
-    hits = total = 0
-    for t in range(warm, T - hp, step):
-        hist = px.iloc[:t]
-        scores, ok = _engine_scores(hist, engine, freq_per_year)
-        if not ok:
-            continue
-        order = scores.sort_values(ascending=False)
-        names = list(order.index)
-        k = min(int(n_pairs), len(names) // 2)
-        for j in range(k):
-            win, lose = names[j], names[-(j + 1)]
-            if win == lose:
-                continue
-            try:
-                fwd_w = px[win].iloc[t + hp] / px[win].iloc[t] - 1.0
-                fwd_l = px[lose].iloc[t + hp] / px[lose].iloc[t] - 1.0
-            except Exception:
-                continue
-            if not (np.isfinite(fwd_w) and np.isfinite(fwd_l)):
-                continue
-            predicted_up = True if engine != "trend" else (float(order.iloc[j]) > 0)
-            realised_up = (fwd_w - fwd_l) > 0
-            hits += int(realised_up == predicted_up)
-            total += 1
-    if total == 0:
-        return None, 0
-    return hits / total, total
-
-
-def confidence_from_hit_rate(hit_rate, n_checks, shrink_k=25.0, cap=0.90):
-    """Turn a realised hit rate into an Idzorek confidence.
-
-    A rule that is right half the time carries no information, so it should get
-    ZERO confidence and be ignored by the posterior. Hence:
-
-        confidence = 2 * (hit_rate - 0.5)
-
-    A 50% hit rate gives 0%; 60% gives 20%; 75% gives 50%. Then shrink toward
-    zero when the sample is small — twelve observations of a 70% hit rate is
-    not evidence — and cap below 100% because no rule deserves certainty.
-    """
-    if hit_rate is None or n_checks <= 0:
-        return 0.0, "no history — view ignored"
-    raw = 2.0 * (float(hit_rate) - 0.5)
-    if raw <= 0:
-        return 0.0, (f"hit rate {hit_rate*100:,.0f}% over {n_checks} checks — no better than "
-                     f"chance, so the view is ignored")
-    shrunk = raw * (n_checks / (n_checks + shrink_k))
-    c = float(np.clip(shrunk, 0.0, cap))
-    return c, (f"hit rate {hit_rate*100:,.0f}% over {n_checks} checks → confidence "
-               f"{c*100:,.0f}% (shrunk for sample size)")
-
-
-def omega_he_litterman(P, Sigma, tau):
-    """Omega = diag(P (tau Sigma) P').  The classic choice: a view is assumed to
-    be exactly as uncertain as the prior is about that same combination of
-    assets. Needs no user input at all."""
-    P = np.asarray(P, dtype=float)
-    if P.size == 0:
-        return np.zeros((0, 0))
-    M = P @ (tau * np.asarray(Sigma, dtype=float)) @ P.T
-    d = np.clip(np.diag(M).astype(float), 1e-12, None)
-    return np.diag(d)
-
-
-def omega_idzorek(P, Q, Sigma, tau, delta, w_mkt, pi, conf):
-    """Idzorek (2005): back Omega out of a 0-100% confidence per view.
-
-    For each view k, on its own:
-      1. compute the posterior you would get at 100% confidence (Omega -> 0);
-      2. that posterior implies unconstrained weights w_100; the departure from
-         the market portfolio is  D = w_100 - w_mkt;
-      3. the user's confidence c means they want a tilt of  c * D, i.e. target
-         weights  w_target = w_mkt + c * D;
-      4. solve numerically for the scalar omega that reproduces w_target.
-
-    Step 4 is a well-behaved 1-D problem, so a bounded scalar search over
-    log10(omega) is both faster and far more robust than Idzorek's original
-    closed-form approximation. Note this whole construction is UNCONSTRAINED —
-    Omega is calibrated on the analytic weights, and any box / gross-exposure
-    constraints are applied afterwards by the optimiser. That is standard
-    practice, but it does mean a heavily constrained portfolio will not tilt by
-    exactly the confidence the user asked for.
-    """
-    P = np.asarray(P, dtype=float)
-    Sigma = np.asarray(Sigma, dtype=float)
-    pi = np.asarray(pi, dtype=float)
-    w_mkt = np.asarray(w_mkt, dtype=float)
-    k = P.shape[0]
-    if k == 0:
-        return np.zeros((0, 0))
-
-    tauS = tau * Sigma
-    omegas = np.zeros(k)
-
-    for i in range(k):
-        Pk = P[i:i + 1, :]
-        Qk = np.array([Q[i]], dtype=float)
-        c = float(np.clip(conf[i], 1e-4, 0.9999))
-
-        denom = _scalar(Pk @ tauS @ Pk.T)
-        if denom <= 0 or not np.isfinite(denom):
-            omegas[i] = 1e6          # degenerate view -> effectively ignored
-            continue
-
-        # 100%-confidence posterior for this view alone
-        mu_100 = pi + (tauS @ Pk.T).ravel() * ((Qk[0] - _scalar(Pk @ pi)) / denom)
-        w_100 = implied_confidence_weights(mu_100, Sigma, delta)
-        w_target = w_mkt + c * (w_100 - w_mkt)
-
-        def _resid(log_om, Pk=Pk, Qk=Qk, w_target=w_target):
-            om = np.array([[10.0 ** float(log_om)]])
-            mu_k = posterior_mu(pi, Sigma, Pk, Qk, om, tau)
-            w_k = implied_confidence_weights(mu_k, Sigma, delta)
-            return float(np.sum((w_k - w_target) ** 2))
-
-        try:
-            res = minimize_scalar(_resid, bounds=(-14.0, 8.0), method="bounded",
-                                  options={"xatol": 1e-8})
-            omegas[i] = 10.0 ** float(res.x)
-        except Exception:
-            omegas[i] = denom        # fall back to He-Litterman for this view
-
-    return np.diag(np.clip(omegas, 1e-14, None))
-
-
-# ---------------------------------------------------------
-# The posterior
-# ---------------------------------------------------------
-def posterior_mu(pi, Sigma, P, Q, Omega, tau):
-    """Black-Litterman posterior expected (excess) returns.
-
-    Uses the Sherman-Morrison-Woodbury form
-        mu = pi + tau*Sigma*P' (P tau*Sigma P' + Omega)^-1 (Q - P pi)
-    rather than the textbook
-        mu = [(tau Sigma)^-1 + P' Omega^-1 P]^-1 [(tau Sigma)^-1 pi + P' Omega^-1 Q]
-    They are algebraically identical, but the first inverts a k x k matrix
-    (k = number of views, usually 1-5) instead of an n x n one, and never
-    inverts Omega — which matters because a high-confidence view drives Omega
-    toward zero and makes Omega^-1 blow up.
-    """
-    pi = np.asarray(pi, dtype=float)
-    if P is None or np.asarray(P).size == 0:
-        return pi.copy()
-    P = np.asarray(P, dtype=float)
-    Q = np.asarray(Q, dtype=float)
-    Omega = np.asarray(Omega, dtype=float)
-    tauS = tau * np.asarray(Sigma, dtype=float)
-
-    A = P @ tauS @ P.T + Omega
-    resid = Q - P @ pi
-    try:
-        adj = tauS @ P.T @ np.linalg.solve(A, resid)
-    except np.linalg.LinAlgError:
-        adj = tauS @ P.T @ (np.linalg.pinv(A) @ resid)
-    return pi + adj
-
-
-def posterior_sigma(Sigma, P, Omega, tau):
-    """Posterior covariance of returns: Sigma_p = Sigma + M, where M is the
-    posterior variance of the mean. Using this instead of Sigma is the
-    theoretically correct thing to do — it says 'I am not certain about the
-    expected returns either' — and it pushes the optimiser toward slightly more
-    diversified portfolios. Off by default because most practitioners, and most
-    textbook worked examples, just use Sigma."""
-    Sigma = np.asarray(Sigma, dtype=float)
-    tauS = tau * Sigma
-    if P is None or np.asarray(P).size == 0:
-        return nearest_psd(Sigma + tauS)
-    P = np.asarray(P, dtype=float)
-    A = P @ tauS @ P.T + np.asarray(Omega, dtype=float)
-    try:
-        M = tauS - tauS @ P.T @ np.linalg.solve(A, P @ tauS)
-    except np.linalg.LinAlgError:
-        M = tauS - tauS @ P.T @ np.linalg.pinv(A) @ P @ tauS
-    return nearest_psd(Sigma + M)
-
-
-def black_litterman(Sigma, w_mkt, rf, tau, delta, P, Q, conf,
-                    omega_method="Idzorek confidence", use_posterior_cov=False):
-    """Full pipeline: equilibrium -> views -> posterior.
-
-    Returns a dict with everything the UI needs to explain what happened,
-    with mu_* reported as TOTAL annual returns (rf added back on).
-    """
-    Sigma = np.asarray(Sigma, dtype=float)
-    w_mkt = np.asarray(w_mkt, dtype=float)
-    pi = equilibrium_returns(delta, Sigma, w_mkt)          # excess
-
-    has_views = P is not None and np.asarray(P).size > 0
-    if has_views:
-        if omega_method == "He-Litterman proportional":
-            Omega = omega_he_litterman(P, Sigma, tau)
-        else:
-            Omega = omega_idzorek(P, Q, Sigma, tau, delta, w_mkt, pi, conf)
-        mu_ex = posterior_mu(pi, Sigma, P, Q, Omega, tau)
-        Sigma_used = posterior_sigma(Sigma, P, Omega, tau) if use_posterior_cov else Sigma
-        view_err = np.asarray(Q, dtype=float) - np.asarray(P, dtype=float) @ pi
-    else:
-        Omega = np.zeros((0, 0))
-        mu_ex = pi.copy()
-        Sigma_used = nearest_psd(Sigma + tau * Sigma) if use_posterior_cov else Sigma
-        view_err = np.zeros(0)
-
-    return {
-        "pi_excess": pi,
-        "mu_excess": mu_ex,
-        "pi_total": pi + rf,
-        "mu_total": mu_ex + rf,
-        "Sigma_used": Sigma_used,
-        "Omega": Omega,
-        "omega_diag": np.diag(Omega) if Omega.size else np.zeros(0),
-        "view_surprise": view_err,          # how far each view sits from equilibrium
-        "has_views": bool(has_views),
-        "w_mkt": w_mkt,
-        "delta": float(delta),
-        "tau": float(tau),
-    }
-
-# =========================================================
-# OPTIMIZATION
-# =========================================================
-def portfolio_stats(w, mu, cov, rf):
-    w = np.asarray(w, dtype=float)
-    ret = float(w @ mu)
-    vol = math.sqrt(max(float(w @ cov @ w), 0.0))
-    sharpe = (ret - rf) / vol if vol > 0 else np.nan
-    return ret, vol, sharpe
-
-
-def _downside_dev(w, R, target_period, freq_per_year):
-    p = R @ w
-    neg = np.minimum(p - target_period, 0.0)
-    dd = math.sqrt(max(np.mean(neg ** 2), 1e-16))
-    return dd * math.sqrt(freq_per_year)
-
-
-def _cvar(w, R, alpha):
-    p = R @ w
-    losses = -p
-    var = np.quantile(losses, alpha)
-    tail = losses[losses >= var]
-    return float(tail.mean()) if len(tail) else float(var)
-
-
-def _stance_bounds(stance, cap, n):
-    if stance == "Long only":
-        return 0.0, cap, 1.0
-    if stance == "Short only":
-        return -cap, 0.0, -1.0
-    return -cap, cap, 1.0  # long-short
-
-
-def _solve(obj_fun, n, lb, ub, net, gross, seed_w=None, extra_starts=None):
-    """Minimise obj_fun over weights subject to the stance/cap/gross constraints."""
-    cons = [{"type": "eq", "fun": lambda w: np.sum(w) - net}]
-    if gross is not None:
-        cons.append({"type": "ineq", "fun": lambda w, g=gross: g - np.sum(np.abs(w))})
-    bounds = tuple((lb, ub) for _ in range(n))
-    starts = [np.clip(np.repeat(net / n, n), lb, ub)]
-    for s in (extra_starts or []):
-        if s is not None:
-            starts.append(np.clip(np.asarray(s, dtype=float), lb, ub))
-    if seed_w is not None:
-        starts.append(np.clip(seed_w, lb, ub))
-    # NB: only SOLVER OUTPUTS are candidates here, never the raw start points.
-    # Starts are clipped into the bounds, which breaks the budget equality --
-    # the analytic pinv seed clips to a book summing to 1.30 on a 30% cap --
-    # and an unconstrained score on an infeasible point beats every legitimate
-    # one. The penalised path needs start points as candidates and so screens
-    # them through feasible() first; this path does not need them at all.
-    best = None
-    for x0 in starts:
-        try:
-            res = minimize(obj_fun, x0, method="SLSQP", bounds=bounds,
-                           constraints=cons, options={"maxiter": 1000, "ftol": 1e-10})
-        except Exception:
-            continue
-        if res.x is None:
-            continue
-        val = obj_fun(res.x)
-        if np.isfinite(val) and (best is None or val < best[0]):
-            best = (val, res.x)
-    if best is None:
-        raise ValueError("Optimisation failed to converge with the chosen constraints.")
-    return best[1]
-
-
-def _optimize_once(objective, mu, cov, R, rf, stance, cap, gross, alpha, freq_per_year,
-                   delta=None, R_ppy=None):
-    """Solve for the optimal weights under the chosen objective and constraints.
-
-    `R_ppy` is how many observations of `R` there are in a year. It exists so
-    the loss-based objectives can be handed HOLDING-PERIOD returns rather than
-    daily ones: the 5% worst day and the 5% worst year are different questions,
-    and a portfolio held for a year should be judged on the second.
-    """
-    mu = np.asarray(mu, dtype=float)
-    cov = np.asarray(cov, dtype=float)
-    n = len(mu)
-    lb, ub, net = _stance_bounds(stance, cap, n)
-    ppy = float(R_ppy) if (R_ppy and R_ppy > 0) else float(freq_per_year)
-    target_period = rf / ppy
-
-    if objective == "Min variance":
-        obj = lambda w: float(w @ cov @ w)
-    elif objective == "Max Sortino":
-        obj = lambda w: -((w @ mu) - rf) / max(
-            _downside_dev(w, R, target_period, ppy), 1e-9)
-    elif objective == "Min CVaR":
-        obj = lambda w: _cvar(w, R, alpha)
-    else:  # Max Sharpe
-        obj = lambda w: -((w @ mu) - rf) / math.sqrt(max(w @ cov @ w, 1e-16))
-
-    seed = None
-    if objective in ("Max Sharpe", "Min variance"):
-        try:
-            inv = np.linalg.pinv(cov)
-            raw = inv @ (mu - rf * np.ones(n)) if objective == "Max Sharpe" else inv @ np.ones(n)
-            if abs(raw.sum()) > 1e-12:
-                seed = raw / raw.sum() * net
-        except Exception:
-            seed = None
-
-    return _solve(obj, n, lb, ub, net, gross, seed_w=seed)
-
-
-def resample_stack(objective, mu, cov, rf, stance, max_weight, gross_limit,
-                   alpha, freq_per_year, resample_n, seed=7, delta=None):
-    """Michaud resampling: return an array (n_draws x n_assets) of optimal weights
-    from simulated histories. Its mean is the robust portfolio; its column std
-    measures how stable each weight is."""
-    cap = max_weight if max_weight is not None else 1.0
-    mu_p = np.asarray(mu, dtype=float) / freq_per_year
-    cov_p = nearest_psd(np.asarray(cov, dtype=float) / freq_per_year)
-    t = 250
-    acc = []
-    for i in range(resample_n):
-        rng = np.random.default_rng(seed + i)
-        sim = rng.multivariate_normal(mu_p, cov_p, size=t)
-        mu_hat = sim.mean(axis=0) * freq_per_year
-        cov_hat = nearest_psd(np.cov(sim, rowvar=False) * freq_per_year)
-        try:
-            acc.append(_optimize_once(objective, mu_hat, cov_hat, sim, rf, stance,
-                                      cap, gross_limit, alpha, freq_per_year, delta=delta))
-        except Exception:
-            continue
-    if not acc:
-        raise ValueError("Resampled optimisation failed on all draws.")
-    return np.array(acc)
-
-
-def optimize_portfolio(objective, mu, cov, R, rf, stance, max_weight, gross_limit,
-                       alpha, freq_per_year, resample_n=0, seed=7, delta=None,
-                       R_ppy=None):
-    cap = max_weight if max_weight is not None else 1.0
-    if resample_n and resample_n > 0:
-        return resample_stack(objective, mu, cov, rf, stance, max_weight, gross_limit,
-                              alpha, freq_per_year, resample_n, seed,
-                              delta=delta).mean(axis=0)
-    return _optimize_once(objective, mu, cov, R, rf, stance, cap, gross_limit, alpha,
-                          freq_per_year, delta=delta, R_ppy=R_ppy)
-
-
-def _min_var_at_target(mu, cov, lb, ub, net, gross, target):
-    """Minimum-variance portfolio hitting a target expected return; None if infeasible."""
-    n = len(mu)
-    cons = [{"type": "eq", "fun": lambda w: np.sum(w) - net},
-            {"type": "eq", "fun": lambda w, t=target: float(w @ mu) - t}]
-    if gross is not None:
-        cons.append({"type": "ineq", "fun": lambda w, g=gross: g - np.sum(np.abs(w))})
-    bounds = tuple((lb, ub) for _ in range(n))
-    starts = [np.clip(np.repeat(net / n, n), lb, ub)]
-    best = None
-    for x0 in starts:
-        try:
-            res = minimize(lambda w: float(w @ cov @ w), x0, method="SLSQP", bounds=bounds,
-                           constraints=cons, options={"maxiter": 800, "ftol": 1e-11})
-        except Exception:
-            continue
-        if res.x is None or not res.success:
-            continue
-        if abs(float(res.x @ mu) - target) > 1e-4 or abs(float(res.x.sum()) - net) > 1e-4:
-            continue
-        v = float(res.x @ cov @ res.x)
-        if best is None or v < best[0]:
-            best = (v, res.x)
-    return None if best is None else best[1]
-
-
-def efficient_frontier(mu, cov, rf, stance, max_weight, gross_limit, n_points=40):
-    """Return dict of arrays describing the efficient frontier under the stance/constraints."""
-    mu = np.asarray(mu, dtype=float)
-    cov = np.asarray(cov, dtype=float)
-    n = len(mu)
-    cap = max_weight if max_weight is not None else 1.0
-    lb, ub, net = _stance_bounds(stance, cap, n)
-
-    def _extreme(sign):
-        try:
-            return _solve(lambda w: -sign * float(w @ mu), n, lb, ub, net, gross_limit)
-        except Exception:
-            return None
-
-    w_hi, w_lo = _extreme(1), _extreme(-1)
-    r_hi = float(w_hi @ mu) if w_hi is not None else float(np.max(mu))
-    r_lo = float(w_lo @ mu) if w_lo is not None else float(np.min(mu))
-    lo, hi = min(r_lo, r_hi), max(r_lo, r_hi)
-    if hi - lo < 1e-9:
-        hi = lo + 1e-3
-
-    rets, vols, sharpes, wts = [], [], [], []
-    for tgt in np.linspace(lo, hi, n_points):
-        w = _min_var_at_target(mu, cov, lb, ub, net, gross_limit, tgt)
-        if w is None:
-            continue
-        r = float(w @ mu)
-        v = math.sqrt(max(float(w @ cov @ w), 0.0))
-        rets.append(r); vols.append(v)
-        sharpes.append((r - rf) / v if v > 0 else np.nan)
-        wts.append(w)
-    return {"ret": np.array(rets), "vol": np.array(vols),
-            "sharpe": np.array(sharpes), "weights": wts}
-
-# =========================================================
-# BACKTEST
-# =========================================================
-def perf_metrics(period_returns, freq_per_year, rf, years=None):
-    """Realised performance. `years` is the actual CALENDAR time the returns span.
-
-    Without it, annualising divides the period count by a nominal 252 trading
-    days. India trades about 247 days a year, so 2,035 observations get treated
-    as 8.075 years when they really span 8.225 -- and every 'per year' figure
-    comes out about 0.25pp too high. That is small, but it is a free
-    overstatement in the app's favour, and 'per year' has to mean a year on the
-    calendar if anyone is going to compare it against a deposit rate.
-    """
-    pr = np.asarray(period_returns, dtype=float)
-    if len(pr) == 0:
-        return None
-    # Periods per year implied by the data itself, falling back to the nominal
-    # figure when the caller cannot supply a span.
-    ppy = (len(pr) / float(years)) if (years and float(years) > 0) else float(freq_per_year)
-    growth = np.prod(1.0 + pr)
-    ann_ret = growth ** (ppy / len(pr)) - 1.0 if growth > 0 else -1.0
-    ann_vol = pr.std(ddof=1) * math.sqrt(ppy) if len(pr) > 1 else 0.0
-    sharpe = (ann_ret - rf) / ann_vol if ann_vol > 0 else np.nan
-    eq = np.cumprod(1.0 + pr)
-    peak = np.maximum.accumulate(eq)
-    max_dd = float((eq / peak - 1.0).min())
-    return {"ann_ret": ann_ret, "ann_vol": ann_vol, "sharpe": sharpe,
-            "max_dd": max_dd, "equity": eq}
-
-
-def _period_returns_of(series, freq, index):
-    """Period returns of a price Series at `freq`, aligned to `index` (0 where missing)."""
-    if series is None or len(series) == 0:
-        return np.zeros(len(index))
-    rule = FREQ_RULE[freq]
-    ps = series if rule is None else series.resample(rule).last()
-    r = ps.pct_change().dropna()
-    return r.reindex(index).fillna(0.0).values
-
-
-
-
-def vol_target_scale(past_returns, target_vol, freq_per_year, lookback,
-                     max_leverage=1.0, min_scale=0.0):
-    """Exposure multiplier k = target_vol / realised_vol(past_returns).
-
-    `past_returns` must contain ONLY periods that have already happened — the
-    caller is responsible for that, and it is the whole ballgame: peeking one
-    period ahead turns volatility targeting from a real effect into a fantasy.
-
-    Why this works at all: volatility is strongly autocorrelated (a turbulent
-    week is followed by a turbulent week) while returns essentially are not. So
-    yesterday's volatility forecasts tomorrow's, and you can size against it,
-    whereas yesterday's return tells you nothing about tomorrow's. Cutting
-    exposure when risk is high therefore avoids losses more often than it
-    misses gains, which is why the Sharpe ratio improves rather than just the
-    volatility falling.
-
-    max_leverage=1.0 means the strategy can only ever DE-RISK into cash — it
-    never borrows. That is the conservative default here.
-    """
-    pr = np.asarray(past_returns, dtype=float)
-    pr = pr[np.isfinite(pr)]
-    if len(pr) < max(5, lookback // 4):
-        return 1.0                       # not enough history yet: stay fully invested
-    window = pr[-int(lookback):] if len(pr) > lookback else pr
-    realised = float(np.std(window, ddof=1)) * math.sqrt(freq_per_year)
-    if not np.isfinite(realised) or realised <= 1e-8:
-        return float(max_leverage)
-    k = float(target_vol) / realised
-    return float(np.clip(k, min_scale, max_leverage))
-
-
-def buy_and_hold_returns(R, w):
-    """Period returns of a basket bought at weights `w` and then LEFT ALONE.
-
-    The obvious-looking `R @ w` is not this. Applying a fixed weight vector to
-    every period silently rebalances the portfolio back to `w` every single
-    period — so a 'yearly rebalanced' strategy computed that way is really a
-    daily-rebalanced one that happens to re-optimise once a year, and every
-    rebalance frequency collapses to nearly the same result.
-
-    Here the holdings drift: each asset's value compounds at its own return, and
-    the portfolio return is the change in the total.
-    """
-    R = np.asarray(R, dtype=float)
-    w = np.asarray(w, dtype=float)
-    if R.size == 0:
-        return np.zeros(0), w.copy()
-    growth = np.cumprod(1.0 + R, axis=0)          # per-asset value path
-    V = growth @ w                                # portfolio value path, V(0-)=1
-    prev = np.concatenate(([float(np.sum(w))], V[:-1]))
-    with np.errstate(divide="ignore", invalid="ignore"):
-        r = np.where(np.abs(prev) > 1e-12, V / prev - 1.0, 0.0)
-    # weights the portfolio has DRIFTED to by the end — what the next rebalance
-    # actually trades away from, and therefore what turnover must be measured
-    # against.
-    end_val = w * growth[-1]
-    tot = float(np.sum(end_val))
-    w_end = end_val / tot if abs(tot) > 1e-12 else w.copy()
-    return r, w_end
-
-
-def run_backtest(prices, freq, use_log, mu_builder, cov_method, freq_per_year, rf,
-                 stance, max_weight, gross_limit, objective, alpha,
-                 train_frac, resample_n,
-                 rebalance_periods=21, rebal_label="periodic",
-                 bench_prices=None, fx_prices=None, bench_label="Index",
-                 caps_weights=None,
-                 vol_target=None, vol_lookback=None, vol_max_leverage=1.0,
-                 vol_target_frac=None, delta=None, capital=None,
-                 horizon_aware=True):
-    """Walk-forward backtest: starting after an initial training window, re-build
-    the expected returns every `rebalance_periods` periods using all data up to
-    that point (expanding window) and hold those weights until the next
-    rebalance. All returns are converted into the reporting currency using the
-    FX path (fx_prices), and an index buy-and-hold (bench_prices) is included as
-    a 'beat the market' benchmark.
-
-    The only structural difference from the Markowitz version is `mu_builder`:
-    a callable (train_returns, cov_annual) -> (mu_annual_total, Sigma_to_use).
-    That lets the same engine drive either a plain historical/shrinkage mu or a
-    Black-Litterman posterior, and lets the BL prior be re-derived at every
-    rebalance from data available at that time — which is what keeps the test
-    genuinely out-of-sample.
-    """
-    # Everything the holding period changes about the model is derived here from
-    # training data only, and re-derived at every rebalance.
-    R_est = to_returns(prices, freq, use_log)           # for estimation
-    R_simple = to_returns(prices, freq, False)          # native realised P&L
-    R_simple = R_simple.reindex(R_est.index).dropna()
-    R_est = R_est.reindex(R_simple.index).dropna()
-    T = len(R_est)
-    if T < 24:
-        return None
-    start_i = int(T * train_frac)
-    if start_i < 12 or (T - start_i) < 6:
-        return None
-    rebalance_periods = max(1, int(rebalance_periods))
-
-    # FX path (report per native) and index path, aligned to R_simple.
-    fx_ret = _period_returns_of(fx_prices, freq, R_simple.index)
-    idx_ret = _period_returns_of(bench_prices, freq, R_simple.index)
-    fx_applied = fx_prices is not None
-
-    def to_report(native_arr, i0, i1):
-        return (1.0 + np.asarray(native_arr)) * (1.0 + fx_ret[i0:i1]) - 1.0
-
-    n = R_est.shape[1]
-    prev_w = np.zeros(n)
-    pnl, dates = [], []
-    n_rebalances = 0
-    turnover_sum = 0.0
-    port_value = float(capital) if (capital and capital > 0) else 1.0
-    # Where each holding period starts and stops inside `pnl`. The walk-forward
-    # loop already buys a portfolio and holds it for exactly one horizon before
-    # touching it again -- so every one of these segments IS a complete
-    # "buy it and hold it for a week / a month / a year" experiment. Recording
-    # the boundaries costs nothing and turns one 8-year path into a few hundred
-    # independent answers to the question people actually ask.
-    seg_bounds = []
-
-    # Volatility targeting state. `hist` accumulates the fully-invested (k=1)
-    # portfolio return of each period as it happens, so the scale applied at
-    # period j is computed strictly from periods < j.
-    # Two ways to set the target:
-    #   ABSOLUTE  — a fixed number (12%), which is right for a diversified book
-    #               and badly wrong for a concentrated one. A 12% target on a
-    #               24% portfolio parks it permanently at half exposure.
-    #   RELATIVE  — a fraction of the portfolio's OWN volatility, recomputed at
-    #               each rebalance from the training window only. This scales
-    #               with whatever you happen to be holding and never needs
-    #               hand-tuning per market.
-    # The relative target must come from data available at the rebalance, not
-    # from the full sample — using the realised volatility of the whole backtest
-    # to set the target would be look-ahead bias dressed up as convenience.
-    relative_vt = vol_target_frac is not None and vol_target_frac > 0
-    do_vt = relative_vt or (vol_target is not None and vol_target > 0)
-    targets_used = []
-    if vol_lookback is None:
-        vol_lookback = max(10, int(freq_per_year / 4))     # ~3 months
-    hist_unscaled = []
-    scales = []
-    pnl_unscaled = []
-    prev_k = 1.0
-    rf_period = rf / freq_per_year
-
-    i = start_i
-    while i < T:
-        tr = R_est.iloc[:i]                              # expanding window
-        try:
-            cov_tr = estimate_cov(tr, cov_method, freq_per_year)
-            # The holding period reaches the model here: rescale each asset's
-            # variance by how it actually behaves over a hold of this length,
-            # measured on data available at this point and nowhere else.
-            if horizon_aware and rebalance_periods > 1:
-                vr_tr = variance_ratio(tr.values, rebalance_periods)
-                cov_use = apply_variance_ratio(cov_tr.values, vr_tr)
-                R_obj = horizon_returns(tr.values, rebalance_periods)
-                ppy_obj = freq_per_year / float(rebalance_periods)
-            else:
-                cov_use = cov_tr.values
-                R_obj = tr.values
-                ppy_obj = freq_per_year
-            mu_tr, sigma_tr = mu_builder(tr, cov_use)
-            w = optimize_portfolio(objective, np.asarray(mu_tr, dtype=float), sigma_tr,
-                                   R_obj, rf, stance, max_weight, gross_limit,
-                                   alpha, freq_per_year, resample_n=resample_n,
-                                   delta=delta, R_ppy=ppy_obj)
-        except Exception:
-            w = prev_w if n_rebalances > 0 else np.repeat(1.0 / n, n)
-
-        turnover = float(np.sum(np.abs(w - prev_w)))
-        turnover_sum += turnover
-        n_rebalances += 1
-
-        end_j = min(i + rebalance_periods, T)
-        # Buy the target weights, then LET THEM DRIFT until the next rebalance.
-        # `w_drift` is where the portfolio actually ends up, and is what the next
-        # rebalance trades away from.
-        seg, w_drift = buy_and_hold_returns(R_simple.iloc[i:end_j].values, w)
-        seg = seg.astype(float)
-        seg_report = to_report(seg, i, end_j)                       # -> reporting ccy
-
-        if do_vt:
-            # Resolve THIS rebalance's target. In relative mode it is a fraction
-            # of the portfolio's own volatility measured on the training window
-            # (data strictly before period i), so it adapts to a concentrated
-            # tech book and a diversified one alike without any hand-tuning.
-            if relative_vt:
-                train_p = R_simple.iloc[:i].values @ w
-                train_p = train_p[np.isfinite(train_p)]
-                if len(train_p) > 5:
-                    train_vol = float(np.std(train_p, ddof=1)) * math.sqrt(freq_per_year)
-                    target_now = float(vol_target_frac) * train_vol
-                else:
-                    target_now = vol_target if vol_target else 0.12
-            else:
-                target_now = vol_target
-            targets_used.append(target_now)
-
-            # Seed the volatility history with the training period the first
-            # time through, so period one is already sized sensibly rather than
-            # defaulting to fully invested.
-            if not hist_unscaled:
-                warm = (R_simple.iloc[max(0, start_i - 4 * vol_lookback):start_i].values @ w)
-                hist_unscaled.extend(np.asarray(warm, dtype=float).tolist())
-            scaled = np.empty_like(seg_report)
-            for t, r_t in enumerate(seg_report):
-                k = vol_target_scale(hist_unscaled, target_now, freq_per_year,
-                                     vol_lookback, vol_max_leverage)
-                # the un-invested fraction earns the risk-free rate
-                scaled[t] = k * r_t + (1.0 - k) * rf_period
-                scales.append(k)
-                prev_k = k
-                port_value *= (1.0 + float(scaled[t]))
-                hist_unscaled.append(float(r_t))       # only past data feeds the next k
-            pnl.extend(scaled.tolist())
-        else:
-            pnl.extend(seg_report.tolist())
-            for r_t in seg_report:
-                port_value *= (1.0 + float(r_t))
-
-        seg_bounds.append((len(pnl) - (end_j - i), len(pnl), i, end_j))
-        pnl_unscaled.extend(seg_report.tolist())        # same strategy, always fully invested
-        dates.extend(list(R_simple.index[i:end_j]))
-        prev_w = w_drift                                # what we actually hold now
-        i = end_j
-
-    if not pnl:
-        return None
-
-    m = len(pnl)
-    # The real elapsed time of the out-of-sample window, from the dates
-    # themselves rather than from a nominal trading-day count.
-    _d = pd.DatetimeIndex(dates)
-    test_years = ((_d[-1] - _d[0]).days / 365.25) if len(_d) > 1 else None
-    if not test_years or test_years <= 0:
-        test_years = m / float(freq_per_year)
-    wb = np.repeat(1.0 / n, n)
-    pb_native, _ = buy_and_hold_returns(R_simple.iloc[start_i:start_i + m].values, wb)
-    pb = to_report(pb_native, start_i, start_i + m)                  # equal-weight, reporting ccy
-
-    # ---- one holding period at a time ----
-    # Compounded return of each individual hold, plus what the index did over
-    # exactly the same days. This is the honest answer to "if I buy this and
-    # hold it for one week, what happens?" -- not one path, but every such
-    # period the out-of-sample window contains.
-    pnl_arr = np.asarray(pnl, dtype=float)
-    idx_full = (to_report(idx_ret[start_i:start_i + m], start_i, start_i + m)
-                if (bench_prices is not None and np.any(idx_ret[start_i:start_i + m] != 0))
-                else None)
-    hold = []
-    for (a, b, i0, i1) in seg_bounds:
-        if b <= a or b > len(pnl_arr):
-            continue
-        r_s = float(np.prod(1.0 + pnl_arr[a:b]) - 1.0)
-        r_i = (float(np.prod(1.0 + idx_full[a:b]) - 1.0)
-               if idx_full is not None and b <= len(idx_full) else np.nan)
-        hold.append({"start": R_simple.index[i0], "end": R_simple.index[i1 - 1],
-                     "periods": int(b - a), "strat": r_s, "index": r_i})
-
-    strat = perf_metrics(np.array(pnl), freq_per_year, rf, years=test_years)
-    bench = perf_metrics(pb, freq_per_year, rf, years=test_years)
-
-    # Buy-and-hold the CAP-WEIGHTED market portfolio of the same names. This is
-    # the benchmark that actually matters for Black-Litterman: with no views the
-    # model is anchored on exactly this portfolio, so it is the honest
-    # 'did the machinery add anything?' line.
-    market_perf = None
-    if caps_weights is not None:
-        wm = np.asarray(caps_weights, dtype=float)
-        if wm.shape[0] == n and np.isfinite(wm).all():
-            pm_native, _ = buy_and_hold_returns(
-                R_simple.iloc[start_i:start_i + m].values, wm)
-            market_perf = perf_metrics(to_report(pm_native, start_i, start_i + m),
-                                       freq_per_year, rf, years=test_years)
-
-    index_perf = None
-    if bench_prices is not None and np.any(idx_ret[start_i:start_i + m] != 0):
-        idx_report = to_report(idx_ret[start_i:start_i + m], start_i, start_i + m)
-        index_perf = perf_metrics(idx_report, freq_per_year, rf, years=test_years)
-
-    # The same strategy without the volatility overlay — the honest like-for-like
-    # comparison that shows whether the overlay earned its keep.
-    unscaled_perf = perf_metrics(np.array(pnl_unscaled), freq_per_year, rf,
-                                 years=test_years) if do_vt else None
-
-    return {"strat": strat, "bench": bench, "index": index_perf, "index_label": bench_label,
-            "market": market_perf,
-            "vt_applied": bool(do_vt), "unscaled": unscaled_perf,
-            "vt_relative": bool(relative_vt), "vt_frac": vol_target_frac,
-            "vt_target": (float(np.mean(targets_used)) if targets_used else vol_target),
-            "vt_lookback": vol_lookback,
-            "vt_max_leverage": vol_max_leverage,
-            "avg_scale": float(np.mean(scales)) if scales else 1.0,
-            "min_scale": float(np.min(scales)) if scales else 1.0,
-            "max_scale": float(np.max(scales)) if scales else 1.0,
-            "scales": np.array(scales) if scales else None,
-            "dates": pd.DatetimeIndex(dates), "fx_applied": fx_applied,
-            "train_start": R_est.index[0], "split_date": R_est.index[start_i],
-            "n_test": m, "n_train": start_i, "test_years": float(test_years),
-            "holds": hold,
-            "n_rebalances": n_rebalances, "rebal_label": rebal_label,
-            "avg_turnover": turnover_sum / max(n_rebalances, 1)}
-
-# =========================================================
-# METADATA + CURRENCY / FX
-# =========================================================
-def infer_currency_from_suffix(ticker: str):
-    ticker = (ticker or "").upper().strip()
-    suffix_map = {".L": "GBP", ".T": "JPY", ".NS": "INR", ".BO": "INR", ".HK": "HKD",
-                  ".TO": "CAD", ".V": "CAD", ".AX": "AUD", ".NZ": "NZD", ".SI": "SGD",
-                  ".KS": "KRW", ".KQ": "KRW", ".SS": "CNY", ".SZ": "CNY", ".AS": "EUR",
-                  ".PA": "EUR", ".MI": "EUR", ".DE": "EUR", ".MC": "EUR", ".SW": "CHF",
-                  ".OL": "NOK", ".CO": "DKK", ".ST": "SEK", ".HE": "EUR", ".JO": "ZAR",
-                  ".MX": "MXN"}
-    for suffix, ccy in suffix_map.items():
-        if ticker.endswith(suffix):
-            return ccy
-    if "." not in ticker:
-        return "USD"
-    return None
-
-
-@st.cache_data(show_spinner=False)
-def get_ticker_meta(ticker):
-    tk = yf.Ticker(ticker)
-    meta = {"currency": None, "exchange": None, "name": None}
-    try:
-        fi = getattr(tk, "fast_info", None)
-        if fi:
-            meta["currency"] = fi.get("currency") or meta["currency"]
-            meta["exchange"] = fi.get("exchange") or meta["exchange"]
-    except Exception:
-        pass
-    try:
-        info = tk.info
-        meta["currency"] = meta["currency"] or info.get("currency")
-        meta["exchange"] = meta["exchange"] or info.get("exchange")
-        meta["name"] = info.get("shortName") or info.get("longName") or meta["name"]
-    except Exception:
-        pass
-    if not meta["currency"]:
-        meta["currency"] = infer_currency_from_suffix(ticker)
-    meta["currency"] = (meta["currency"] or "").upper().strip() or None
-    meta["exchange"] = meta["exchange"] or ""
-    meta["name"] = meta["name"] or ""
-    return meta
-
-
-@st.cache_data(show_spinner=False)
-def _last_close(symbol):
-    try:
-        df = yf.download(symbol, period="10d", interval="1d",
-                         auto_adjust=True, progress=False, group_by="column")
-        if df is None or df.empty:
-            return np.nan
-        if isinstance(df.columns, pd.MultiIndex):
-            if "Close" not in df.columns.get_level_values(0):
-                return np.nan
-            s = df["Close"].dropna()
-        else:
-            if "Close" not in df.columns:
-                return np.nan
-            s = df["Close"].dropna()
-        if len(s) == 0:
-            return np.nan
-        return float(s.iloc[-1].item() if hasattr(s.iloc[-1], "item") else s.iloc[-1])
-    except Exception:
-        return np.nan
-
-
-def get_fx_rate(native_ccy, report_ccy):
-    native_ccy = (native_ccy or "").upper().strip()
-    report_ccy = (report_ccy or "").upper().strip()
-    if not native_ccy:
-        return np.nan, "Missing native currency", False
-    if not report_ccy:
-        return np.nan, "Missing reporting currency", False
-    if native_ccy == report_ccy:
-        return 1.0, "No conversion needed", True
-    direct = f"{native_ccy}{report_ccy}=X"
-    r = _last_close(direct)
-    if pd.notna(r) and r > 0:
-        return r, direct, True
-    inverse = f"{report_ccy}{native_ccy}=X"
-    r_inv = _last_close(inverse)
-    if pd.notna(r_inv) and r_inv > 0:
-        return 1.0 / r_inv, f"Inverse of {inverse}", True
-    if native_ccy != "USD" and report_ccy != "USD":
-        n_usd = _last_close(f"{native_ccy}USD=X")
-        if not (pd.notna(n_usd) and n_usd > 0):
-            usd_n = _last_close(f"USD{native_ccy}=X")
-            if pd.notna(usd_n) and usd_n > 0:
-                n_usd = 1.0 / usd_n
-        r_usd = _last_close(f"{report_ccy}USD=X")
-        if not (pd.notna(r_usd) and r_usd > 0):
-            usd_r = _last_close(f"USD{report_ccy}=X")
-            if pd.notna(usd_r) and usd_r > 0:
-                r_usd = 1.0 / usd_r
-        if pd.notna(n_usd) and n_usd > 0 and pd.notna(r_usd) and r_usd > 0:
-            return n_usd / r_usd, f"USD bridge: {native_ccy}->USD and {report_ccy}->USD", True
-    return np.nan, f"FX unavailable for {native_ccy}->{report_ccy}", False
-
 
 def pretty_df(df, decimals_map=None):
     out = df.copy()
@@ -2101,25 +47,6 @@ def pretty_df(df, decimals_map=None):
                 return x
             out[col] = out[col].apply(_fmt)
     return out
-
-
-def monte_carlo_cloud(mu, cov, rf, stance, n_points=3000, seed=42):
-    rng = np.random.default_rng(seed)
-    n = len(mu)
-    rets, vols, sharpes = [], [], []
-    for _ in range(n_points):
-        if stance == "Long only":
-            w = rng.random(n); w = w / w.sum()
-        elif stance == "Short only":
-            w = rng.random(n); w = -(w / w.sum())
-        else:
-            w = rng.normal(size=n); s = w.sum()
-            if abs(s) < 1e-9:
-                continue
-            w = w / s
-        r, v, sh = portfolio_stats(w, mu, cov, rf)
-        rets.append(r); vols.append(v); sharpes.append(sh)
-    return np.array(vols), np.array(rets), np.array(sharpes)
 
 # =========================================================
 # STREAMLIT UI  (the numeric core above imports cleanly without it)
@@ -2548,11 +475,20 @@ def _render_backtest(res, bt, bt_eq=None):
         f"{test_start.date()} to {test_end.date()}. Turnover averaged "
         f"{turn*100:,.0f}% of the book per rebalance.{fx_note}")
 
-    st.caption(
-        "**No trading costs, taxes or borrowing charges are modelled anywhere in this app.** "
-        "Every figure is a gross, frictionless result. Your own costs come off the top of it, "
-        "and they are larger the more often you trade — so read the higher-frequency horizons "
-        "as the most flattered, not the best.")
+    _cbps = float(bt.get("cost_bps", 0.0) or 0.0)
+    if _cbps > 0:
+        st.caption(
+            f"**Net of trading costs at {_cbps:,.0f} bps one-way** on every rebalance, "
+            f"including the first purchase: about **{bt.get('cost_drag_ann', 0.0)*100:,.2f}pp "
+            f"a year** of drag on {bt.get('ann_turnover', 0.0)*100:,.0f}% annual turnover. "
+            f"Taxes and borrowing charges are not modelled.")
+    else:
+        st.caption(
+            "**Gross of all costs.** No trading costs, taxes or borrowing charges are "
+            "deducted (set a trading cost in Advanced settings to change that). Costs come off "
+            "the top and grow with how often you trade — so read the higher-frequency horizons "
+            f"as the most flattered, not the best. This run turned over "
+            f"{bt.get('ann_turnover', 0.0)*100:,.0f}% of the book a year.")
 
     # ---- volatility-targeting overlay: did it earn its keep? ----
     if bt.get("vt_applied") and bt.get("unscaled") is not None:
@@ -2778,6 +714,7 @@ def _render_backtest(res, bt, bt_eq=None):
                 q2.metric("Pure equilibrium", f"{r_eq*100:,.2f}%/yr")
                 q3.metric("Sharpe", f"{sh_rule:,.2f}",
                           delta=f"{sh_rule - sh_eq:+,.2f} vs no views")
+                _render_inference(bt)
                 if abs(d_r) < 0.002:
                     st.info(
                         f"**The rule made essentially no difference** ({d_r*100:+,.2f}pp a year). "
@@ -2790,11 +727,11 @@ def _render_backtest(res, bt, bt_eq=None):
                         f"this path.** The construction is sound — views rebuilt from scratch at "
                         f"every rebalance from data available then, confidence recalibrated from "
                         f"the hit rate at that point, no look-ahead — but that establishes the "
-                        f"test was fair, not that the edge is real. A single historical path "
-                        f"cannot distinguish a {d_r*100:,.2f}pp edge from noise, and the confidence "
-                        f"the rule earned ({res.get('sys_conf', 0)*100:,.0f}%) is itself a measure "
-                        f"of how weak the signal was. Treat it as a hypothesis worth re-testing on "
-                        f"another market, not as a result.")
+                        f"test was fair, not that the edge is real. Read the interval above, not "
+                        f"the point estimate; the confidence the rule earned "
+                        f"({res.get('sys_conf', 0)*100:,.0f}%) is a second measure of how weak "
+                        f"the signal was. Treat it as a hypothesis worth re-testing on another "
+                        f"market, not as a result.")
                 else:
                     st.warning(
                         f"**The rule cost {abs(d_r)*100:,.2f}pp a year versus doing nothing.** That "
@@ -2868,6 +805,78 @@ def _render_backtest(res, bt, bt_eq=None):
             f"tells you about the market, not about the model.")
 
 
+def _render_inference(bt):
+    """Interval and p-values for the rule's gap to pure equilibrium."""
+    inf = bt.get("inference") or {}
+    bs, lw, be = inf.get("bootstrap"), inf.get("sharpe_test"), inf.get("breakeven_bps")
+    if not bs:
+        return
+    r = bs["ann_return"]
+    i1, i2, i3 = st.columns(3)
+    i1.metric("Return gap, 95% interval",
+              f"{r['lo']*100:+,.2f} to {r['hi']*100:+,.2f}pp",
+              help=f"Stationary block bootstrap of the paired per-period returns "
+                   f"({bs['n_boot']:,} resamples, mean block {bs['mean_block']} periods). "
+                   f"Resampling both runs on the same dates keeps their correlation, which "
+                   f"is what makes a small gap measurable at all. Arithmetic mean, so it can "
+                   f"differ slightly from the compounded figure above.")
+    i2.metric("p-value, return gap", f"{r['p']:.3f}")
+    if lw:
+        i3.metric("p-value, Sharpe gap", f"{lw['p']:.3f}",
+                  help=f"Ledoit & Wolf (2008) test: delta method with a Newey-West HAC "
+                       f"covariance (lag {lw['lag']}), valid under fat tails and serial "
+                       f"dependence. Sharpe gap {lw['diff']:+.2f}, standard error "
+                       f"{lw['se']:.2f}.")
+    inside = r["lo"] <= 0.0 <= r["hi"]
+    if inside:
+        st.caption(
+            f"**Statistically indistinguishable from zero.** The interval runs from "
+            f"{r['lo']*100:+,.2f} to {r['hi']*100:+,.2f}pp a year and includes no "
+            f"difference at all. This is the precise version of \"the rule added nothing\": "
+            f"not proof that it has no edge, but no evidence that it does.")
+    else:
+        st.caption(
+            f"**The gap is significant at 5% on this path** (p = {r['p']:.3f}). Before "
+            f"believing it: this app offers four rules, and trying all four makes a "
+            f"false positive somewhere roughly four times as likely — a Bonferroni bar would be "
+            f"p < 0.0125. Re-test on another market before acting on it.")
+    if be is not None:
+        st.caption(
+            f"**Break-even trading cost ≈ {be:,.0f} bps one-way.** Above that, the extra "
+            f"turnover the rule generates costs more than its gross edge over equilibrium "
+            f"(first-order estimate). Compare it with what your broker actually charges.")
+
+
+def _render_rolling(res):
+    """The same test from many start dates."""
+    df = res.get("rolling")
+    sm = summarise_rolling(df)
+    if sm is None:
+        return
+    st.markdown("##### The same test from many start dates")
+    r1, r2, r3 = st.columns(3)
+    r1.metric(f"Median gap vs {sm['vs']}", f"{sm['median_gap']*100:+,.2f}pp/yr",
+              help=f"Across {sm['n_windows']} three-year windows, starting every six months.")
+    r2.metric("10th to 90th percentile",
+              f"{sm['p10']*100:+,.2f} to {sm['p90']*100:+,.2f}pp")
+    r3.metric("Windows ahead / behind",
+              f"{sm['share_positive']*100:,.0f}% / {sm['share_negative']*100:,.0f}%",
+              help="By more than 0.01pp a year; the rest are ties.")
+    show = df.assign(**{
+        "Window": [f"{a.date()} → {b.date()}" for a, b in zip(df["start"], df["end"])],
+        "Strategy %/yr": df["strategy"] * 100, "Reference %/yr": df["reference"] * 100,
+        "Gap pp/yr": df["gap"] * 100})[["Window", "Strategy %/yr", "Reference %/yr", "Gap pp/yr"]]
+    st.bar_chart(show.set_index("Window")["Gap pp/yr"], height=220)
+    with st.expander("Every window"):
+        st.dataframe(pretty_df(show, {"Strategy %/yr": 2, "Reference %/yr": 2, "Gap pp/yr": 2}),
+                     hide_index=True, width='stretch')
+    st.caption(
+        "The windows overlap, so they are not independent samples and the band above is "
+        "not a confidence interval. What it shows is how much the headline result depends "
+        "on the start date. A gap that changes sign from one window to the next was never "
+        "a stable property of the strategy.")
+
+
 def render_results(res):
     bc = res["base_currency"]
     weights = res["weights"]
@@ -2909,6 +918,7 @@ def render_results(res):
                     "training fraction, or use a higher return frequency.")
         else:
             _render_backtest(res, res["bt"], res.get("bt_eq"))
+            _render_rolling(res)
     with tabs[4]:
         _render_execution(res, bc)
     with tabs[5]:
@@ -2975,8 +985,9 @@ def _render_trade_list(res, bc):
         + (f", plus **{res['new_cash']:,.0f} {bc}** of new cash you asked to deploy"
            if res.get("new_cash", 0) > 0 else "")
         + f" — a book of **{cap:,.0f} {bc}**. Rows marked HOLD are already within one "
-          f"tradeable lot of their target, so there is nothing to place. No trading costs are "
-          f"modelled: judge for yourself whether a small adjustment is worth your brokerage.")
+          f"tradeable lot of their target, so there is nothing to place. The trade list does "
+          f"not net costs off: judge for yourself whether a small adjustment is worth your "
+          f"brokerage.")
 
 
     show = df[df["Action"].isin(["BUY", "SELL"])] if (n_buy + n_sell) else df
@@ -3175,8 +1186,7 @@ def main():
         st.markdown(
             "Paste what you hold and the **What to buy** tab becomes a **trade list** — "
             "buy, sell, or hold, per position — instead of a from-scratch shopping list. "
-            "Positions whose target has barely moved will say *hold*, because the model is "
-            "charged for trading and small adjustments do not repay their own commission.")
+            "Positions within one tradeable lot of their target will say *hold*.")
         holdings_text = st.text_area(
             "One position per line: ticker, then number of shares",
             value="", height=140, placeholder="RELIANCE.NS 40\nBHARTIARTL.NS, 55\nHDFCBANK.NS: 48",
@@ -3185,8 +1195,7 @@ def main():
         new_cash = st.number_input(
             f"New cash you want to add ({base_currency})", min_value=0.0, value=0.0, step=1000.0,
             help="Left at zero, the trade list rebalances what you already hold and nothing more. "
-                 "Set it and the model deploys that cash too — and pays commission to do so, "
-                 "which is why a small top-up may sensibly go into only one or two names.")
+                 "Set it and the model deploys that cash too, spread across the targets.")
 
     hcfg = HORIZON_CFG[horizon]
     today = pd.Timestamp.today().normalize()
@@ -3257,6 +1266,8 @@ def main():
     omega_method = "Idzorek confidence"
     use_posterior_cov = False
     backtest_uses_views = False
+    cost_bps = 0.0
+    do_rolling = False
 
     if mode == "Advanced":
         with st.expander("Black-Litterman settings — τ, δ, Ω", expanded=True):
@@ -3339,14 +1350,21 @@ def main():
                                                "more here than in plain Markowitz.")
             with a3:
                 ret_freq = st.selectbox("Return frequency", ["Daily", "Weekly", "Monthly"],
-                                        index=["Daily", "Weekly", "Monthly"].index(hcfg["freq"]))
+                                        index=["Daily", "Weekly", "Monthly"].index(ret_freq),
+                                        help="Defaults to daily, or weekly when the universe "
+                                             "spans time zones (daily correlations across "
+                                             "sessions are understated).")
                 use_log = st.checkbox("Use log returns", value=True)
             c1, c3 = st.columns(2)
             with c1:
-                st.caption("**No costs are modelled.** Trading costs, taxes and borrowing "
-                           "charges are deliberately left out: this app answers *how should "
-                           "the money be allocated*, not *what will my broker charge*. Every "
-                           "return shown is gross of all of it.")
+                cost_bps = st.number_input(
+                    "Trading cost (bps, one-way)", 0.0, 200.0, 0.0, 1.0,
+                    help="Charged on every rebalance as this many basis points of the value "
+                         "traded, including the first purchase. 0 = gross, as before. The "
+                         "backtest also reports the BREAK-EVEN cost — the level at which the "
+                         "strategy's edge over its own prior is used up — so you can judge "
+                         "it against your own broker without the app guessing your fees. "
+                         "Taxes and borrowing charges are not modelled.")
             with c3:
                 resample_n = st.slider("Resampling draws (Michaud)", 0, 100, 0, 5,
                                        help="0 = off. Higher = sturdier weights but slower.")
@@ -3419,7 +1437,29 @@ def main():
                                                        "views, typed today, are applied to 2019 — which "
                                                        "is look-ahead bias and cannot be evidence of "
                                                        "anything. Useful only to see how views propagate.")
+            do_rolling = st.checkbox(
+                "Repeat the backtest from many start dates (slower)", value=False,
+                help="Re-runs the walk-forward test over 3-year windows starting every 6 "
+                     "months. One backtest is one path from one start date; this shows how "
+                     "much the answer depends on when you happened to begin.")
 
+
+    settings = Settings(
+        market=market_name, horizon=horizon, stance=stance, capital=float(total_capital),
+        base_currency=base_currency, rf=float(rf_annual), n_holdings=n_holdings,
+        start=pd.Timestamp(start_date), end=pd.Timestamp(end_date), ret_freq=ret_freq,
+        use_log=use_log, cov_method=cov_method, objective=objective, cvar_alpha=cvar_alpha,
+        resample_n=resample_n, max_weight_pct=max_weight_pct, gross_pct=gross_pct, tau=tau,
+        delta_mode=delta_mode, delta_manual=delta_manual, omega_method=omega_method,
+        use_posterior_cov=use_posterior_cov, use_vol_target=use_vol_target,
+        vol_target_relative=vol_target_mode.startswith("Relative"),
+        vol_target_pct=vol_target_pct, vol_target_frac_pct=vol_target_frac_pct,
+        vol_max_lev=vol_max_lev, vol_lookback=vol_lookback, train_frac=train_frac,
+        cost_bps=float(cost_bps), auto_trim=(mode != "Advanced"))
+    # Derived once, from the FINAL return frequency. Computing this before the
+    # Advanced panel meant a switch to weekly returns turned "every 21 periods"
+    # into every 21 weeks.
+    _reb_periods = settings.reb_periods
 
     top_n = n_holdings
     native_ccy = MARKETS[market_name]["currency"]
@@ -3456,124 +1496,16 @@ def main():
     if st.button("① Load universe & equilibrium", type="primary"):
         for k in ("uni", "res", "frontier_chart"):
             st.session_state.pop(k, None)
-        if start_date >= end_date:
-            st.error("History start must be earlier than history end.")
+        try:
+            with st.spinner("Downloading market data and market capitalisations "
+                            "(the caps are what the prior is built from)..."):
+                _uni = load_universe(settings)
+        except PipelineError as e:
+            st.error(str(e))
             st.stop()
-
-        seed_tickers = MARKETS[market_name]["tickers"]
-        with st.spinner("Downloading market data..."):
-            close, volume = download_prices_volume(
-                seed_tickers, start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d"),
-                interval=("1wk" if ret_freq == "Weekly" else "1d"))
-        if close.empty:
-            st.error(
-                "No price data returned. Common causes:\n\n"
-                "1. **Corrupted yfinance cache** (`DatabaseError: database disk image is malformed`). "
-                "Close the app and run in PowerShell: "
-                "`Remove-Item -Recurse -Force \"$env:LOCALAPPDATA\\py-yfinance\"`, then relaunch.\n\n"
-                "2. **Rate-limited by Yahoo** (`Too Many Requests`). Wait a few minutes.\n\n"
-                "3. **Outdated library**: `python -m pip install --upgrade yfinance curl_cffi`."
-            )
-            st.stop()
-
-        top_tickers = rank_by_liquidity(close, volume, top_n)
-
-        # Capital-aware trim. Rank by liquidity first, then check whether the
-        # money can actually express that many positions in whole shares. In
-        # Simple mode we cut automatically and say so; in Advanced we respect
-        # the user's choice and warn instead.
-        _cand_px = [float(close[t].dropna().iloc[-1]) for t in top_tickers
-                    if t in close.columns and not close[t].dropna().empty]
-        _lots = [lot_size_for(t) for t in top_tickers if t in close.columns]
-        _lot_px = [p * l for p, l in zip(_cand_px, _lots)]
-        fit_n = affordable_holdings(_lot_px, total_capital, len(top_tickers))
-        auto_trimmed = None
-        if fit_n < len(top_tickers):
-            if mode != "Advanced":
-                auto_trimmed = (len(top_tickers), fit_n)
-                top_tickers = top_tickers[:fit_n]
-            else:
-                st.warning(
-                    f"**{total_capital:,.0f} {base_currency} may not stretch to "
-                    f"{len(top_tickers)} positions.** At these share prices roughly "
-                    f"**{fit_n} names** can be held with enough granularity to express "
-                    f"their weights; beyond that, positions round down hard and money "
-                    f"sits in cash. Lower *Number of stocks to hold*, or accept the "
-                    f"rounding — the 'What to buy' tab reports exactly how much stays idle.")
-
-        # Choose the estimation window from the data rather than imposing one.
-        # A naive dropna() over a fixed 15-year request would silently truncate
-        # EVERY asset to the youngest one's history; a fixed short window would
-        # starve Sigma. This picks the longest window that still supports a
-        # full-sized universe, and backfills the dropped names from the next
-        # most liquid long-lived candidates.
-        _all_ranked = rank_by_liquidity(close, volume, min(len(close.columns), 4 * top_n))
-        _win_start, _keep, _win_note = choose_history_window(
-            close, _all_ranked, top_n, hcfg, FREQ_PER_YEAR[ret_freq])
-        _cand = _keep[:top_n] if len(_keep) >= top_n else _keep
-        prices = close.loc[close.index >= _win_start, _cand].dropna()
-        history_note = _win_note
-        if prices.shape[1] < 2 or prices.empty:
-            st.error("Could not assemble at least 2 liquid tickers with overlapping history. "
-                     "Widen the date range or increase the number of stocks.")
-            st.stop()
-
-        usable = list(prices.columns)
-        n_assets = len(usable)
-        freq_per_year = FREQ_PER_YEAR[ret_freq]
-        returns = to_returns(prices, ret_freq, use_log)
-        if returns.shape[0] < 10:
-            st.error(f"Not enough {ret_freq.lower()} observations ({returns.shape[0]}) to estimate "
-                     f"risk/return. Widen the date range or use a higher frequency.")
-            st.stop()
-
-        max_weight = None if max_weight_pct >= 100 else max_weight_pct / 100.0
-        if max_weight is not None and max_weight * n_assets < 1.0 - 1e-9:
-            st.error(f"Max weight per stock ({max_weight_pct}%) is too low for {n_assets} stocks. "
-                     f"Raise it to at least {math.ceil(100 / n_assets)}% or add more stocks.")
-            st.stop()
-
-        with st.spinner("Fetching market capitalisations (this is what the prior is built from)..."):
-            caps = get_market_caps(usable)
-
-        cov = estimate_cov(returns, cov_method, freq_per_year)
-        # liquidity fallback for the market portfolio if caps are unusable
-        liq = None
-        if volume is not None and not volume.empty:
-            common = [t for t in usable if t in volume.columns]
-            if len(common) == n_assets:
-                dv = (prices[common] * volume[common]).median(axis=0, skipna=True)
-                if np.isfinite(dv.values).all() and dv.values.sum() > 0:
-                    liq = dv.values
-        w_mkt, w_mkt_note = market_weights(usable, caps, fallback_weights=liq)
-
-        hist_annual = returns.mean().values * freq_per_year
-        n_available = int(sum(1 for c in close.columns if not close[c].dropna().empty))
-
-        st.session_state["uni"] = {
-            "signature": f"{market_name}|{top_n}|{ret_freq}|{start_date}|{end_date}|{cov_method}",
-            "market_name": market_name, "usable": usable, "n_assets": n_assets,
-            "prices": prices, "returns": returns, "cov": cov,
-            "sigma": np.sqrt(np.diag(cov.values)),
-            "caps": caps, "w_mkt": w_mkt, "w_mkt_note": w_mkt_note,
-            "mkt_hist_return": float(w_mkt @ hist_annual),
-            "hist_annual": hist_annual,
-            "freq_per_year": freq_per_year, "ret_freq": ret_freq, "use_log": use_log,
-            "native_ccy": native_ccy,
-            "start_str": start_date.strftime("%Y-%m-%d"), "end_str": end_date.strftime("%Y-%m-%d"),
-            "universe_note": (
-                history_note +
-                (f"**Trimmed from {auto_trimmed[0]} to {auto_trimmed[1]} names to fit "
-                 f"{total_capital:,.0f} {base_currency}.** At these share prices, "
-                 f"{auto_trimmed[0]} positions would round down hard and leave a large "
-                 f"slice of your money sitting in cash — a drag bigger than anything the "
-                 f"optimiser is deciding. Override in Advanced settings. "
-                 if auto_trimmed else "") +
-                f"Selected the {n_assets} most liquid of {n_available} stocks that downloaded "
-                f"successfully from {market_name} ({n_universe} in the index). "
-                + ("" if n_available >= n_universe else
-                   f"{n_universe - n_available} symbol(s) were unavailable on Yahoo and skipped.")),
-        }
+        for _w in _uni["warnings"]:
+            st.warning(_w)
+        st.session_state["uni"] = _uni
 
     uni = st.session_state.get("uni")
 
@@ -3685,8 +1617,15 @@ def main():
             h1.metric("Historical hit rate", f"{hr*100:,.0f}%" if hr is not None else "—",
                       help="How often this rule got the direction right, walking forward through "
                            "your history window using only data available at each point.")
-            h2.metric("Checks", f"{nchecks}",
-                      help="Independent out-of-sample observations behind that hit rate.")
+            _hp = hit_rate_pvalue(hr, nchecks)
+            h2.metric("Independent checks", f"{nchecks}",
+                      delta=(f"p = {_hp:.2f} vs chance" if _hp is not None else None),
+                      delta_color="off",
+                      help="Distinct dates the rule was tested on, spaced at least one holding "
+                           "period apart so the outcomes do not overlap. Several pairs are "
+                           "scored on each date, but they share that date's market move, so "
+                           "they count once. The p-value is a one-sided test of 'better than "
+                           "a coin flip'.")
             h3.metric("Confidence assigned", f"{sys_conf*100:,.0f}%",
                       help="confidence = 2 x (hit rate - 50%), shrunk for sample size. A rule that "
                            "is right half the time carries no information and gets zero.")
@@ -3959,96 +1898,37 @@ def main():
             # ---- walk-forward backtest ----
             bt = bt_eq = None
             if do_backtest:
-                bench_ticker, bench_lbl = BENCHMARKS.get(market_name, (None, "Index"))
-                bench_prices = (get_series_close(bench_ticker, uni["start_str"], uni["end_str"])
-                                if bench_ticker else None)
-                fx_prices = get_fx_series(uni["native_ccy"], base_currency,
-                                          uni["start_str"], uni["end_str"])
-                caps_map = uni["caps"]; liq_fallback = None
-
-                # Re-walking the entire history to re-measure a hit rate at every
-                # single rebalance costs ~90ms a time — 40 seconds across a
-                # weekly backtest, for a number that barely moves between
-                # adjacent weeks. Recompute it only when the training window has
-                # grown by 5% or more; that is still strictly backward-looking.
-                _hr_cache = {}
-
-                def _cached_hit_rate(px_now, engine, fpy, hp):
-                    bucket = int(math.log(max(len(px_now), 2)) / math.log(1.05))
-                    key = (engine, hp, bucket)
-                    if key not in _hr_cache:
-                        _hr_cache[key] = engine_hit_rate(px_now, engine, fpy, holding_periods=hp)
-                    return _hr_cache[key]
-
-                def _make_builder(with_views, engine=None):
-                    def _builder(train_returns, cov_annual):
-                        # re-derive the prior from data available at this point only
-                        w_m, _ = market_weights(usable, caps_map, fallback_weights=liq_fallback)
-                        hist = train_returns.mean().values * freq_per_year
-                        if delta_mode == "Set it myself":
-                            d = float(delta_manual)
-                        else:
-                            d, _n = implied_risk_aversion(w_m, cov_annual, float(w_m @ hist) - rf)
-
-                        if engine is not None:
-                            # THE HONEST PATH. Rebuild the views from the rule using
-                            # only prices up to this rebalance, and recalibrate the
-                            # confidence from the rule's hit rate over that same
-                            # window. Nothing from the future enters, so unlike typed
-                            # views this genuinely tests whether views add value.
-                            px_now = prices.loc[:train_returns.index[-1]]
-                            hr_t, nc_t = _cached_hit_rate(px_now, engine, freq_per_year,
-                                                          _reb_periods)
-                            c_t, _ = confidence_from_hit_rate(hr_t, nc_t)
-                            Pe, Qe, ce, _lab = systematic_views(
-                                px_now, usable, engine, freq_per_year,
-                                n_pairs=sys_n_pairs, conf=c_t)
-                            out = black_litterman(cov_annual, w_m, rf, tau, d, Pe, Qe, ce,
-                                                  omega_method=omega_method,
-                                                  use_posterior_cov=use_posterior_cov)
-                        elif with_views:
-                            out = black_litterman(cov_annual, w_m, rf, tau, d, P, Q, conf,
-                                                  omega_method=omega_method,
-                                                  use_posterior_cov=use_posterior_cov)
-                        else:
-                            out = black_litterman(cov_annual, w_m, rf, tau, d,
-                                                  np.zeros((0, len(usable))), np.zeros(0), np.zeros(0),
-                                                  omega_method=omega_method,
-                                                  use_posterior_cov=use_posterior_cov)
-                        return out["mu_total"], out["Sigma_used"]
-                    return _builder
-
-                bt_args = dict(freq=ret_freq, use_log=use_log, cov_method=cov_method,
-                               freq_per_year=freq_per_year, rf=rf, stance=stance,
-                               max_weight=max_weight, gross_limit=gross_limit, objective=objective,
-                               alpha=cvar_alpha,
-                               train_frac=train_frac, resample_n=min(resample_n, 10),
-                               rebalance_periods=_reb_periods, rebal_label=hcfg["rebal_label"],
-                               bench_prices=bench_prices, fx_prices=fx_prices, bench_label=bench_lbl,
-                               caps_weights=w_mkt,
-                               vol_target=((vol_target_pct / 100.0) if use_vol_target
-                                           and not vol_target_mode.startswith("Relative")
-                                           else None),
-                               vol_target_frac=((vol_target_frac_pct / 100.0) if use_vol_target
-                                                and vol_target_mode.startswith("Relative")
-                                                else None),
-                               vol_lookback=vol_lookback, vol_max_leverage=vol_max_lev,
-                               delta=delta, capital=total_capital)
-                run_views = bool(backtest_uses_views and bl["has_views"])
-                if sys_engine is not None:
-                    # Systematic views can be tested honestly, so always run the
-                    # pair: rule-driven vs pure equilibrium. The gap between them
-                    # IS the answer to "do views add value?".
-                    with st.spinner("Back-testing the rule against pure equilibrium "
-                                    "(re-deriving views at every rebalance)..."):
-                        bt = run_backtest(prices, mu_builder=_make_builder(False, engine=sys_engine),
-                                          **bt_args)
-                        bt_eq = run_backtest(prices, mu_builder=_make_builder(False), **bt_args)
-                else:
-                    with st.spinner("Back-testing (walk-forward, re-deriving the equilibrium each time)..."):
-                        bt = run_backtest(prices, mu_builder=_make_builder(run_views), **bt_args)
-                        if run_views:
-                            bt_eq = run_backtest(prices, mu_builder=_make_builder(False), **bt_args)
+                _bench, _fx, _bench_lbl = fetch_benchmark_and_fx(uni, settings)
+                _spin = ("Back-testing the rule against pure equilibrium (re-deriving views "
+                         "at every rebalance)..." if sys_engine is not None else
+                         "Back-testing (walk-forward, re-deriving the equilibrium each time)...")
+                with st.spinner(_spin):
+                    bt, bt_eq = run_backtests(
+                        uni, settings, rf=rf, P=P, Q=Q, conf=conf, engine=sys_engine,
+                        n_pairs=sys_n_pairs,
+                        apply_typed_views=bool(backtest_uses_views and bl["has_views"]),
+                        bench=_bench, fx=_fx, bench_label=_bench_lbl, delta=delta)
+                if bt is not None and bt_eq is not None:
+                    # Is the gap to the prior real, or one path's luck? Paired
+                    # tests on the per-period returns of the two runs.
+                    bt["inference"] = {
+                        "bootstrap": paired_bootstrap(bt["pnl"], bt_eq["pnl"],
+                                                      freq_per_year, rf=rf),
+                        "sharpe_test": sharpe_diff_test(bt["pnl"], bt_eq["pnl"],
+                                                        freq_per_year, rf=rf),
+                        "breakeven_bps": breakeven_cost_bps(bt, bt_eq),
+                    }
+                rolling = None
+                if do_rolling and bt is not None:
+                    _bar = st.progress(0.0, text="Repeating the test from staggered start dates...")
+                    rolling = rolling_origin(
+                        uni, settings, rf=rf, P=P, Q=Q, conf=conf, engine=sys_engine,
+                        n_pairs=sys_n_pairs,
+                        apply_typed_views=bool(backtest_uses_views and bl["has_views"]),
+                        fx=_fx, delta=delta,
+                        progress=lambda f: _bar.progress(f, text="Repeating the test from "
+                                                                 "staggered start dates..."))
+                    _bar.empty()
 
             # ---- execution table ----
             targets_report = [float(weights[i] * invest_capital) for i in range(len(usable))]
@@ -4194,6 +2074,7 @@ def main():
                 "weights_df": weights_df, "has_stability": wstd is not None,
                 "frontier": frontier, "mc_vols": mcv, "mc_rets": mcr, "mc_sharpes": mcs,
                 "do_backtest": do_backtest, "bt": bt, "bt_eq": bt_eq,
+                "rolling": (rolling if do_backtest else None),
                 "backtest_uses_views": bool(backtest_uses_views and bl["has_views"]),
                 "sys_engine": sys_engine, "sys_conf": sys_conf,
                 "sys_conf_note": sys_conf_note,
